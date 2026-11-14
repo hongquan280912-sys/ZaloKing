@@ -1,0 +1,2528 @@
+-- Zalo Hub: Garden Tower Defense
+-- Macro | Teleport | Automation | Player | Performance | Settings
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local Lighting = game:GetService("Lighting")
+local TeleportService = game:GetService("TeleportService")
+local VirtualUser = game:GetService("VirtualUser")
+local HttpService = game:GetService("HttpService")
+local LP = Players.LocalPlayer
+
+local FILE_CFG = "ZaloHub_GTD_config.json"
+local FILE_MACRO = "ZaloHub_GTD_macro.json"
+local FILE_ICON = "ZaloHub_icon_v1.png"
+
+-- ===== TRẠNG THÁI =====
+local S = {
+    speed = 3, autoSpeed = false, autoSkip = false,
+    autoReplay = false, autoLeave = false, voteLevel = 0, upgradeAll = false,
+    macroLoop = true, cycle = 5, recAll = false,
+    tpPlace = true, waveSync = true, runAfterRec = true, followMobs = false, followDist = 10, followMode = 2, enemyName = "",
+    walk = 16, jump = 50, useWalk = false, useJump = false,
+    infJump = false, noclip = false, antiAFK = true,
+    hidePlayers = false, noEffects = false,
+    macroAuto = true, startDelay = 3,
+    autoRejoin = false, autoLobby = false, lobbyPlayers = 1,
+    mapName = "Farm Frenzy", mapMode = "Classic", mapLevel = 1, mapIdx = 1, modeIdx = 1,
+}
+
+local copyFn = setclipboard or toclipboard
+
+-- Đánh dấu luồng đang chạy của chính script (để không ghi lại lệnh của mình)
+local ownCo = setmetatable({}, { __mode = "k" })
+local function ownCall(f)
+    local co = coroutine.running()
+    ownCo[co] = true
+    local r = table.pack(pcall(f))
+    ownCo[co] = nil
+    return table.unpack(r, 1, r.n)
+end
+
+-- ===== LƯU / NẠP FILE =====
+local canFile = (writefile and readfile and isfile) and true or false
+local function saveFile(path, text)
+    if canFile then pcall(writefile, path, text) end
+end
+local function loadFile(path)
+    if canFile and isfile(path) then
+        local ok, r = pcall(readfile, path)
+        if ok then return r end
+    end
+end
+
+do
+    local raw = loadFile(FILE_CFG)
+    if raw then
+        local ok, d = pcall(function() return HttpService:JSONDecode(raw) end)
+        if ok and type(d) == "table" then
+            for k, v in pairs(d) do
+                if S[k] ~= nil and type(S[k]) == type(v) then S[k] = v end
+            end
+        end
+    end
+end
+
+-- ===== TIỆN ÍCH GAME =====
+local remoteCache = {}
+local function remote(name)
+    local r = remoteCache[name]
+    if r and r.Parent then return r end
+    for _, v in ipairs(RS:GetDescendants()) do
+        if v.Name == name and (v:IsA("RemoteEvent") or v:IsA("RemoteFunction")) then
+            remoteCache[name] = v
+            return v
+        end
+    end
+end
+
+local function fire(name, ...)
+    local r = remote(name)
+    if not r then return end
+    local a = table.pack(...)
+    ownCall(function()
+        if r:IsA("RemoteFunction") then
+            r:InvokeServer(table.unpack(a, 1, a.n))
+        else
+            r:FireServer(table.unpack(a, 1, a.n))
+        end
+    end)
+end
+
+local function rootPart()
+    local ch = LP.Character
+    return ch and ch:FindFirstChild("HumanoidRootPart")
+end
+
+local function isShown(o)
+    while o and o ~= game do
+        if o:IsA("GuiObject") and not o.Visible then return false end
+        if o:IsA("ScreenGui") and not o.Enabled then return false end
+        o = o.Parent
+    end
+    return true
+end
+
+local function press(btn)
+    local ok = false
+    if firesignal then
+        ok = pcall(function() firesignal(btn.MouseButton1Click) end)
+        pcall(function() firesignal(btn.Activated) end)
+    end
+    if not ok and getconnections then
+        for _, sig in ipairs({ btn.MouseButton1Click, btn.Activated }) do
+            pcall(function()
+                for _, c in ipairs(getconnections(sig)) do c:Fire() end
+            end)
+        end
+    end
+end
+
+-- ===== QUÉT GIAO DIỆN 1 LẦN / GIÂY (dùng chung để đỡ lag) =====
+local curWave, waveStart, matchSerial = 0, os.clock(), 0
+local lastPresent, goneFlag = os.clock(), false
+local snap = { wave = nil, present = false, btn = {} }
+
+local WANT = { ["play again"] = true, ["return to lobby"] = true, ["upgrade all"] = true }
+
+local function takeSnapshot()
+    local s = { wave = nil, present = false, btn = {} }
+    local pg = LP:FindFirstChild("PlayerGui")
+    if not pg then return s end
+    local lvl = S.voteLevel > 0 and ("level " .. S.voteLevel) or nil
+    for _, o in ipairs(pg:GetDescendants()) do
+        if o:IsA("TextLabel") or o:IsA("TextButton") then
+            local t = o.Text
+            if t ~= "" and #t < 40 then
+                local lt = t:lower()
+                if WANT[lt] or lt == lvl then
+                    if isShown(o) and not s.btn[lt] then s.btn[lt] = o end
+                elseif lt:find("wave", 1, true) then
+                    local w = t:match("Wave%s*(%d+)%s*/%s*%d+")
+                    if (w or lt:find("next wave", 1, true)) and isShown(o) then
+                        s.present = true
+                        if w then s.wave = tonumber(w) end
+                    end
+                elseif lt:find("enemies arrive", 1, true) or lt:find("enemies incoming", 1, true) then
+                    if isShown(o) then s.present = true end
+                end
+            end
+        end
+    end
+    return s
+end
+
+local function clickSnap(text)
+    local o = snap.btn[text:lower()]
+    if not o or not o.Parent then return false end
+    local pg = LP:FindFirstChild("PlayerGui")
+    local b = o
+    while b and b ~= pg and not b:IsA("GuiButton") do b = b.Parent end
+    if b and b:IsA("GuiButton") then
+        press(b)
+        return true
+    end
+    return false
+end
+
+-- Theo dõi wave hiện tại và phát hiện trận mới
+local function updateWave(s)
+    if s.present then
+        if goneFlag then
+            matchSerial += 1
+            curWave = s.wave or 0
+            waveStart = os.clock()
+            goneFlag = false
+        elseif s.wave then
+            if s.wave < curWave then
+                matchSerial += 1
+                curWave = s.wave
+                waveStart = os.clock()
+            elseif s.wave ~= curWave then
+                curWave = s.wave
+                waveStart = os.clock()
+            end
+        end
+        lastPresent = os.clock()
+    elseif os.clock() - lastPresent > 6 then
+        goneFlag = true
+    end
+end
+
+-- ===== NHẬT KÝ / MÔ TẢ DỮ LIỆU =====
+local runLog, logT0 = {}, os.clock()
+local function logLine(s)
+    runLog[#runLog + 1] = ("[%.1f] %s"):format(os.clock() - logT0, s)
+    if #runLog > 120 then table.remove(runLog, 1) end
+end
+
+local function describe(v, d)
+    d = d or 0
+    local t = typeof(v)
+    if t == "Instance" then return v.ClassName .. ":" .. v.Name end
+    if t == "Vector3" then return ("V3(%.0f,%.0f,%.0f)"):format(v.X, v.Y, v.Z) end
+    if t == "CFrame" then
+        local p = v.Position
+        return ("CF(%.0f,%.0f,%.0f)"):format(p.X, p.Y, p.Z)
+    end
+    if t == "string" then return '"' .. v:sub(1, 24) .. '"' end
+    if t == "table" then
+        if d >= 2 then return "{...}" end
+        local out, n = {}, 0
+        for k, x in pairs(v) do
+            if k ~= "n" then
+                n += 1
+                if n > 6 then
+                    out[#out + 1] = "..."
+                    break
+                end
+                out[#out + 1] = tostring(k) .. "=" .. describe(x, d + 1)
+            end
+        end
+        return "{" .. table.concat(out, ", ") .. "}"
+    end
+    return tostring(v)
+end
+
+local function describeArgs(a)
+    local out = {}
+    for i = 1, (a.n or #a) do out[#out + 1] = describe(a[i]) end
+    return table.concat(out, ", ")
+end
+
+-- ===== DỊCH CHUYỂN + TÌM QUÁI =====
+local holdUntil = 0 -- trong lúc macro đang đặt unit, tạm dừng "đi theo quái"
+local followGoal = nil -- điểm đến của chế độ "Lướt mượt"
+
+local function tpTo(cf)
+    local root = rootPart()
+    if not root or not cf then return end
+    holdUntil = os.clock() + 1
+    if (root.Position - cf.Position).Magnitude > 3 then
+        root.CFrame = cf
+        root.AssemblyLinearVelocity = Vector3.zero
+        task.wait(0.35)
+    end
+end
+
+local SKIPFOLDER = { towers = true, units = true, tower = true, unit = true, map = true, placed = true }
+
+local function underSkipFolder(m)
+    local p = m.Parent
+    while p and p ~= workspace do
+        if SKIPFOLDER[p.Name:lower()] then return true end
+        p = p.Parent
+    end
+    return false
+end
+
+local function modelOf(b)
+    local a = b.Adornee or b.Parent
+    if not a then return nil end
+    if a:IsA("Model") then return a end
+    return a:FindFirstAncestorOfClass("Model")
+end
+
+local function mobAlive(m)
+    if not (m and m.Parent) then return false end
+    local h = m:FindFirstChildOfClass("Humanoid")
+    if h and h.Health <= 0 then return false end
+    return true
+end
+
+-- "Workspace.Contexts.xxx.Entities" -> Instance
+local function resolvePath(s)
+    if not s:find(".", 1, true) then return nil end
+    local cur = game
+    for part in s:gmatch("[^%.]+") do
+        cur = cur and cur:FindFirstChild(part)
+        if not cur then return nil end
+    end
+    return cur
+end
+
+local enemyFolder
+local function findEnemyFolder()
+    if S.enemyName ~= "" then
+        local f = resolvePath(S.enemyName) or workspace:FindFirstChild(S.enemyName, true)
+        if f then return f end
+    end
+    if enemyFolder and enemyFolder.Parent then return enemyFolder end
+    for _, n in ipairs({ "Enemies", "Enemy", "Mobs", "Mob", "Monsters", "Zombies" }) do
+        local f = workspace:FindFirstChild(n)
+        if f then
+            enemyFolder = f
+            return f
+        end
+    end
+    local f = workspace:FindFirstChild("Entities", true)
+    if f then enemyFolder = f end
+    return f
+end
+
+-- Trong thư mục Entities quái có tên dạng enemy_aphid, enemy_ant...
+local function enemyChildren(folder)
+    local named, all = {}, {}
+    for _, m in ipairs(folder:GetChildren()) do
+        local isNamed = m.Name:lower():sub(1, 5) == "enemy"
+        if (m:IsA("Model") or m:IsA("BasePart")) and (isNamed or m:IsA("Model")) then
+            all[#all + 1] = m
+            if isNamed then named[#named + 1] = m end
+        end
+    end
+    return all
+end
+
+local heavyCache, heavyHow, heavyT = {}, "", -10
+
+local function getEnemies()
+    local folder = findEnemyFolder()
+    if folder then
+        return enemyChildren(folder), "thư mục " .. folder.Name
+    end
+
+    -- Không thấy thư mục: quét nặng, tối đa 4 giây một lần
+    if os.clock() - heavyT < 4 then
+        local keep = {}
+        for _, m in ipairs(heavyCache) do
+            if m.Parent then keep[#keep + 1] = m end
+        end
+        return keep, heavyHow
+    end
+    heavyT = os.clock()
+
+    local out = {}
+    local set = {}
+    for _, container in ipairs({ workspace, LP:FindFirstChild("PlayerGui") }) do
+        if container then
+            for _, b in ipairs(container:GetDescendants()) do
+                if b:IsA("BillboardGui") then
+                    local hasHp = false
+                    for _, t in ipairs(b:GetDescendants()) do
+                        if t:IsA("TextLabel") and t.Text:match("^%s*%d+%s*/%s*%d+%s*$") then
+                            hasHp = true
+                            break
+                        end
+                    end
+                    if hasHp then
+                        local m = modelOf(b)
+                        if m and m ~= LP.Character and not Players:GetPlayerFromCharacter(m)
+                            and not underSkipFolder(m) and not set[m] then
+                            set[m] = true
+                            out[#out + 1] = m
+                        end
+                    end
+                end
+            end
+        end
+    end
+    if #out > 0 then
+        heavyCache, heavyHow = out, "thanh máu x/y"
+        return out, heavyHow
+    end
+
+    for _, h in ipairs(workspace:GetDescendants()) do
+        if h:IsA("Humanoid") and h.Health > 0 then
+            local m = h.Parent
+            if m and m:IsA("Model") and m ~= LP.Character
+                and not Players:GetPlayerFromCharacter(m) and not underSkipFolder(m) then
+                out[#out + 1] = m
+            end
+        end
+    end
+    heavyCache, heavyHow = out, "Humanoid"
+    return out, heavyHow
+end
+
+local function posOf(m)
+    local ok, p = pcall(function()
+        if m:IsA("Model") then return m:GetPivot().Position end
+        return m.Position
+    end)
+    if ok then return p end
+end
+
+local function nearestEnemy()
+    local root = rootPart()
+    if not root then return nil end
+    local list = getEnemies()
+    local best, bd
+    for _, m in ipairs(list) do
+        if mobAlive(m) then
+            local p = posOf(m)
+            if p then
+                local d = (p - root.Position).Magnitude
+                if not bd or d < bd then best, bd = m, d end
+            end
+        end
+    end
+    return best
+end
+
+-- Con đi đầu = con xuất hiện sớm nhất còn sống (bám tới khi nó chết)
+local firstSeen = setmetatable({}, { __mode = "k" })
+local followTarget = nil
+local function leadEnemy()
+    local list = getEnemies()
+    local now = os.clock()
+    local best, bt
+    for _, m in ipairs(list) do
+        if mobAlive(m) then
+            local ts = firstSeen[m]
+            if not ts then
+                ts = now
+                firstSeen[m] = ts
+            end
+            if not bt or ts < bt then best, bt = m, ts end
+        end
+    end
+    return best
+end
+
+-- ===== LỌC QUÁI THẬT + BÁM QUÁI CHẮC (khối do...end: không thêm local cấp cao) =====
+do
+    local rawEnemies = getEnemies
+    local mv = setmetatable({}, { __mode = "k" })     -- theo dõi di chuyển
+    local skipUntil = setmetatable({}, { __mode = "k" })
+    local stuck = setmetatable({}, { __mode = "k" })
+
+    local function looksLikeUnit(m)
+        for _, k in ipairs({ "Owner", "OwnerId", "OwnerUserId", "UserId", "PlacedBy", "Placer" }) do
+            if m:GetAttribute(k) ~= nil then return true end
+        end
+        if m:FindFirstChild("Owner") or m:FindFirstChild("OwnerId") then return true end
+        return false
+    end
+
+    -- Quái: tên bắt đầu "enemy" HOẶC đã từng di chuyển. Unit đứng yên nên không lọt vào.
+    local function realEnemy(m)
+        if m.Name:lower():sub(1, 5) == "enemy" then return true end
+        if looksLikeUnit(m) then return false end
+        local p = posOf(m)
+        if not p then return false end
+        local info = mv[m]
+        if not info then
+            mv[m] = { p0 = p, moved = false }
+            return false
+        end
+        if info.moved then return true end
+        if (p - info.p0).Magnitude > 1.5 then
+            info.moved = true
+            return true
+        end
+        return false
+    end
+
+    getEnemies = function()
+        local list, how = rawEnemies()
+        local out = {}
+        for _, m in ipairs(list) do
+            if realEnemy(m) then out[#out + 1] = m end
+        end
+        return out, how
+    end
+
+    local function deadish(m)
+        if not mobAlive(m) then return true end
+        local hp = m:GetAttribute("Health") or m:GetAttribute("health") or m:GetAttribute("HP")
+        if type(hp) == "number" and hp <= 0 then return true end
+        return false
+    end
+
+    -- cur = mục tiêu đang bám (nếu còn sống và vẫn đang di chuyển thì giữ nguyên)
+    leadEnemy = function(cur)
+        local now = os.clock()
+        if cur and not deadish(cur) then
+            local p = posOf(cur)
+            local st = stuck[cur]
+            if p then
+                if not st or (p - st.p).Magnitude > 0.5 then
+                    stuck[cur] = { p = p, t = now }
+                    return cur
+                elseif now - st.t <= 4 then
+                    return cur
+                end
+                skipUntil[cur] = now + 8 -- đứng im quá 4 giây: tạm bỏ qua để bám con khác
+            end
+        end
+        local best, bt, any, at
+        for _, m in ipairs(getEnemies()) do
+            if not deadish(m) then
+                local ts = firstSeen[m]
+                if not ts then
+                    ts = now
+                    firstSeen[m] = ts
+                end
+                if not at or ts < at then any, at = m, ts end
+                if (skipUntil[m] or 0) < now and (not bt or ts < bt) then best, bt = m, ts end
+            end
+        end
+        return best or any
+    end
+end
+
+-- ===== MACRO: TRẠNG THÁI =====
+local rec, recording, recStart, running = {}, false, 0, false
+local setStatus = function() end
+local refreshRec = function() end
+local refreshRun = function() end
+local statusLbl, unitLbl, miniStatus, recLbl, recFrame, runLbl, runFrame, miniRec, miniRun
+local statusMsg = ""
+local hooked = false
+
+-- ===== MACRO: LOẠI BƯỚC =====
+local function kindOf(name)
+    name = (name or ""):lower()
+    if name:find("place", 1, true) then return "place" end
+    if name:find("upgrade", 1, true) then return "upgrade" end
+    if name:find("sell", 1, true) or name:find("remove", 1, true) or name:find("delete", 1, true)
+        or name:find("destroy", 1, true) or name:find("refund", 1, true) or name:find("retire", 1, true) then
+        return "sell"
+    end
+    return "other"
+end
+
+-- ===== MACRO: LƯU / NẠP (JSON) =====
+local function ser(v)
+    local t = typeof(v)
+    if t == "number" or t == "string" or t == "boolean" then return v end
+    if t == "Vector3" then return { _t = "V3", x = v.X, y = v.Y, z = v.Z } end
+    if t == "CFrame" then return { _t = "CF", c = { v:GetComponents() } } end
+    if t == "Instance" then return { _t = "I", name = v.Name } end
+    if t == "table" then
+        local e = {}
+        for k, x in pairs(v) do
+            local sk, sx = ser(k), ser(x)
+            if sk ~= nil and sx ~= nil then e[#e + 1] = { sk, sx } end
+        end
+        return { _t = "T", e = e }
+    end
+    return nil
+end
+
+local function deser(v)
+    if type(v) ~= "table" then return v end
+    if v._t == "V3" then return Vector3.new(v.x, v.y, v.z) end
+    if v._t == "CF" then return CFrame.new(table.unpack(v.c)) end
+    if v._t == "I" then return remote(v.name) end
+    if v._t == "T" then
+        local o = {}
+        for _, kv in ipairs(v.e) do
+            local k = deser(kv[1])
+            if k ~= nil then o[k] = deser(kv[2]) end
+        end
+        return o
+    end
+    return v
+end
+
+local function serUnits(list)
+    if not list then return nil end
+    local out = {}
+    for _, x in ipairs(list) do
+        out[#out + 1] = { i = x.i, name = x.name, parent = x.parent, pos = { x.pos.X, x.pos.Y, x.pos.Z } }
+    end
+    return out
+end
+
+local function deserUnits(list)
+    if type(list) ~= "table" then return nil end
+    local out = {}
+    for _, x in ipairs(list) do
+        if type(x) == "table" and type(x.pos) == "table" and #x.pos >= 3 then
+            out[#out + 1] = {
+                i = x.i, name = x.name, parent = x.parent,
+                pos = Vector3.new(x.pos[1], x.pos[2], x.pos[3]),
+            }
+        end
+    end
+    return #out > 0 and out or nil
+end
+
+local function v3t(v) return v and { v.X, v.Y, v.Z } or nil end
+local function t3v(t)
+    return (type(t) == "table" and #t == 3) and Vector3.new(t[1], t[2], t[3]) or nil
+end
+
+local function macroToTable()
+    local out = {}
+    for _, e in ipairs(rec) do
+        out[#out + 1] = {
+            t = e.t, remote = e.name, method = e.method,
+            args = ser(e.args), placedId = e.placedId,
+            pos = e.pos and { e.pos:GetComponents() } or nil,
+            units = serUnits(e.units),
+            wave = e.wave, wt = e.wt,
+            kind = e.kind, unit = e.unit, at = v3t(e.at),
+            fx = e.fx, fy = e.fy,
+        }
+    end
+    return out
+end
+
+local function exportMacro()
+    return HttpService:JSONEncode({ kind = "gtd_macro", data = macroToTable() })
+end
+
+local function saveMacroFile()
+    if #rec > 0 then saveFile(FILE_MACRO, exportMacro()) end
+end
+
+local function exportConfig()
+    return HttpService:JSONEncode({ kind = "gtd_config", data = S })
+end
+
+local setters = {}
+
+local function applyConfig(data)
+    for k, v in pairs(data) do
+        if S[k] ~= nil and type(S[k]) == type(v) then
+            S[k] = v
+            if setters[k] then setters[k](v) end
+        end
+    end
+end
+
+local function applyMacro(data)
+    local newRec = {}
+    for _, d in ipairs(data) do
+        local args = deser(d.args)
+        if type(args) ~= "table" then args = { n = 0 } end
+        args.n = args.n or #args
+        local pos
+        if type(d.pos) == "table" and #d.pos >= 12 then
+            pos = CFrame.new(table.unpack(d.pos))
+        end
+        newRec[#newRec + 1] = {
+            t = d.t, name = d.remote, inst = remote(d.remote),
+            method = d.method, args = args, placedId = d.placedId, pos = pos,
+            units = deserUnits(d.units), wave = d.wave, wt = d.wt,
+            kind = d.kind or kindOf(d.remote), unit = d.unit, at = t3v(d.at),
+            fx = d.fx, fy = d.fy,
+        }
+    end
+    rec = newRec
+    return #newRec
+end
+
+local function importText(raw)
+    local ok, obj = pcall(function() return HttpService:JSONDecode(raw) end)
+    if not ok or type(obj) ~= "table" then return "Dữ liệu không hợp lệ" end
+    if obj.kind == "gtd_config" and type(obj.data) == "table" then
+        applyConfig(obj.data)
+        return "Đã nạp config"
+    elseif obj.kind == "gtd_macro" and type(obj.data) == "table" then
+        local n = applyMacro(obj.data)
+        saveMacroFile()
+        return "Đã nạp macro (" .. n .. " bước)"
+    end
+    return "Không nhận ra dữ liệu này"
+end
+
+local loadedSteps = 0
+do
+    local raw = loadFile(FILE_MACRO)
+    if raw then
+        local ok, obj = pcall(function() return HttpService:JSONDecode(raw) end)
+        if ok and type(obj) == "table" and obj.kind == "gtd_macro" and type(obj.data) == "table" then
+            loadedSteps = applyMacro(obj.data)
+        end
+    end
+end
+
+local function recToText()
+    local out = {}
+    for i, e in ipairs(rec) do
+        local p = e.pos and e.pos.Position
+        out[#out + 1] = ("%d | %.1fs | %s:%s(%s)%s%s%s"):format(
+            i, e.t, e.name, e.method, describeArgs(e.args),
+            e.placedId ~= nil and (" -> id " .. tostring(e.placedId)) or "",
+            p and (" @ " .. ("%.0f,%.0f,%.0f"):format(p.X, p.Y, p.Z)) or "",
+            e.wave and (" | wave " .. e.wave .. " +" .. ("%.0f"):format(e.wt or 0) .. "s") or "")
+        if e.result ~= nil then
+            out[#out] = out[#out] .. " | trả về: " .. describeArgs(type(e.result) == "table" and e.result or { e.result, n = 1 }):sub(1, 160)
+        end
+        if e.err then out[#out] = out[#out] .. " | LỖI: " .. e.err end
+    end
+    return table.concat(out, "\n")
+end
+
+-- ===== MACRO: GHI =====
+local seen, seenOrder, lastShown = {}, {}, ""
+local allLog = {} -- nhật ký MỌI remote kèm tham số (để chẩn đoán)
+local placedInfo = {} -- [id server trả về] = { unit, at }
+local SKIP = { "ping", "heartbeat", "camera", "mouse", "cursor", "latency", "fps",
+    "analytic", "telemetry", "report", "replicat", "chat", "afk" }
+
+local KEYS = { "place", "upgrade", "sell", "target", "lock", "remove", "delete",
+    "destroy", "refund", "retire", "auto", "abilit", "skill", "ultimate" }
+local NOTKEYS = { "autoskip", "speed", "tick", "replay", "vote", "afk", "camera", "autoplay" }
+
+local function wanted(name)
+    local n = name:lower()
+    for _, k in ipairs(NOTKEYS) do
+        if n:find(k, 1, true) then return false end
+    end
+    if S.recAll then
+        for _, k in ipairs(SKIP) do
+            if n:find(k, 1, true) then return false end
+        end
+        return true
+    end
+    for _, k in ipairs(KEYS) do
+        if n:find(k, 1, true) then return true end
+    end
+    return false
+end
+
+-- Lấy id unit từ kết quả đặt unit: {true, id} hoặc bảng có Id / UnitId...
+local extractId
+extractId = function(r)
+    if type(r) ~= "table" then return nil end
+    -- giá trị trả về chỉ là một số / chuỗi id
+    if (type(r[1]) == "number" or type(r[1]) == "string") and r[2] == nil then return r[1] end
+    if r[1] == true then
+        local v = r[2]
+        if type(v) == "number" or type(v) == "string" or typeof(v) == "Instance" then return v end
+    end
+    for _, k in ipairs({ "Id", "id", "ID", "UnitId", "unitId", "UnitID", "UID", "Uid", "uid",
+        "Guid", "GUID", "guid", "Key", "key", "Index", "index", "Slot", "UnitUID", "TowerId", "towerId" }) do
+        local v = r[k]
+        if type(v) == "number" or type(v) == "string" then return v end
+    end
+    -- bảng kiểu {true, {Id = ...}} hoặc {{...}}
+    for _, v in pairs(r) do
+        if type(v) == "table" then
+            local x = extractId(v)
+            if x ~= nil then return x end
+        end
+    end
+    return nil
+end
+
+-- Nhớ vị trí của các unit (model trong workspace) được truyền làm tham số
+local function captureUnits(args)
+    local list
+    for i = 1, (args.n or #args) do
+        local v = args[i]
+        if typeof(v) == "Instance" and not v:IsA("RemoteEvent") and not v:IsA("RemoteFunction")
+            and v:IsDescendantOf(workspace) then
+            local ok, p = pcall(function() return v:GetPivot().Position end)
+            if ok then
+                list = list or {}
+                list[#list + 1] = {
+                    i = i, name = v.Name,
+                    parent = v.Parent and v.Parent.Name or nil, pos = p,
+                }
+            end
+        end
+    end
+    return list
+end
+
+-- tìm tên unit (string) và vị trí đặt (Vector3/CFrame) trong args
+local function scanArgs(args)
+    local uname, at
+    local function look(v)
+        local tv = typeof(v)
+        if tv == "Vector3" and not at then at = v
+        elseif tv == "CFrame" and not at then at = v.Position
+        elseif tv == "string" and not uname then uname = v end
+    end
+    for i = 1, (args.n or #args) do
+        local v = args[i]
+        if type(v) == "table" then
+            for _, x in pairs(v) do look(x) end
+        else
+            look(v)
+        end
+    end
+    return uname, at
+end
+
+local lastPlaced = nil
+local function findInfo(args)
+    for i = 1, (args.n or #args) do
+        local v = args[i]
+        local tv = type(v)
+        if tv == "number" or tv == "string" then
+            local f = placedInfo[tostring(v)]
+            if f then return f end
+        elseif tv == "table" then
+            for _, x in pairs(v) do
+                if type(x) == "number" or type(x) == "string" then
+                    local f = placedInfo[tostring(x)]
+                    if f then return f end
+                end
+            end
+        end
+    end
+end
+
+local function addRecInner(self, m, args, result)
+    local name = self.Name
+    if not seen[name] then
+        seen[name] = 0
+        seenOrder[#seenOrder + 1] = name
+    end
+    seen[name] += 1
+    do
+        local ln = name:lower()
+        local noise = false
+        for _, k in ipairs({ "ping", "heartbeat", "camera", "mouse", "cursor", "latency", "fps" }) do
+            if ln:find(k, 1, true) then noise = true break end
+        end
+        if not noise and #allLog < 400 then
+            allLog[#allLog + 1] = ("%.1fs | %s:%s(%s)%s"):format(
+                os.clock() - recStart, name, m, describeArgs(args):sub(1, 220),
+                type(result) == "table" and (" => " .. describeArgs(result):sub(1, 160)) or "")
+        end
+    end
+    if not wanted(name) then
+        if name ~= lastShown then
+            lastShown = name
+            setStatus("Bỏ qua remote: " .. name)
+        end
+        return
+    end
+    if #rec == 0 then recStart = os.clock() end
+
+    local root = rootPart()
+    local e = {
+        t = os.clock() - recStart, inst = self, name = name, method = m, args = args,
+        kind = kindOf(name),
+        pos = root and root.CFrame or nil, -- vị trí nhân vật đang đứng
+        wave = curWave > 0 and curWave or nil,
+        wt = os.clock() - waveStart,
+    }
+    e.units = captureUnits(args)
+    e.result = result
+
+    if e.kind == "place" then
+        e.unit, e.at = scanArgs(args)
+        if m == "InvokeServer" then
+            e.placedId = extractId(result)
+            if e.placedId ~= nil and typeof(e.placedId) ~= "Instance" then
+                placedInfo[tostring(e.placedId)] = { unit = e.unit, at = e.at }
+                lastPlaced = placedInfo[tostring(e.placedId)]
+            end
+        end
+    elseif e.kind == "upgrade" or e.kind == "sell" then
+        local info = findInfo(args)
+        if info then e.unit, e.at = info.unit, info.at end
+        if not e.unit and e.units then
+            e.unit, e.at = e.units[1].name, e.units[1].pos
+        end
+        if not e.unit and not name:lower():find("all", 1, true) then
+            e.unlinked = true
+            setStatus("⚠ " .. name .. ": chưa nhận ra unit (args: " .. describeArgs(args) .. ")")
+        end
+    end
+
+    rec[#rec + 1] = e
+    lastShown = name
+    setStatus("Đã ghi " .. #rec .. " bước · " .. name .. (e.wave and (" · wave " .. e.wave) or ""))
+end
+
+-- Bọc addRec: lỗi khi ghi không được làm mất bước hoặc làm hỏng lệnh gốc của game
+local getId = getthreadidentity or get_thread_identity or (syn and syn.get_thread_identity)
+local setId = setthreadidentity or set_thread_identity or (syn and syn.set_thread_identity)
+
+local function isDup(nm, m, args)
+    local last = rec[#rec]
+    return last ~= nil and last.name == nm and last.method == m
+        and (os.clock() - recStart) - last.t < 0.15
+        and tostring(last.args and last.args[1]) == tostring(args and args[1])
+end
+
+local function addRecCore(self, m, args, result)
+    local okN, nm = pcall(function() return self.Name end)
+    if not okN then return end
+    -- hai lớp hook có thể cùng bắt một lệnh: bỏ lệnh trùng, nhưng giữ kết quả server trả về
+    if isDup(nm, m, args) then
+        local last = rec[#rec]
+        if last.result == nil and result ~= nil then last.result = result end
+        return
+    end
+    local ok, err = pcall(addRecInner, self, m, args, result)
+    if ok then return end
+    pcall(function()
+        if not wanted(nm) then return end
+        if #rec == 0 then recStart = os.clock() end
+        local root = rootPart()
+        rec[#rec + 1] = {
+            t = os.clock() - recStart, inst = self, name = nm, method = m, args = args,
+            kind = kindOf(nm), pos = root and root.CFrame or nil,
+            wave = curWave > 0 and curWave or nil, wt = os.clock() - waveStart,
+            result = result, err = tostring(err):sub(1, 120),
+        }
+        setStatus("Đã ghi " .. #rec .. " bước · " .. nm .. " (lỗi nhận diện unit: " .. tostring(err):sub(1, 80) .. ")")
+    end)
+end
+
+-- Lệnh của game có thể đến từ luồng có quyền thấp: nâng quyền tạm thời khi ghi rồi trả về như cũ
+local function addRec(self, m, args, result)
+    local prev
+    if getId and setId then
+        local okG, v = pcall(getId)
+        if okG and type(v) == "number" then
+            prev = v
+            pcall(setId, 8)
+        end
+    end
+    pcall(addRecCore, self, m, args, result)
+    if prev then pcall(setId, prev) end
+end
+
+local busyCo = nil
+local nc = newcclosure or function(f) return f end
+
+if hookmetamethod and getnamecallmethod then
+    local old
+    old = hookmetamethod(game, "__namecall", nc(function(self, ...)
+        local m = getnamecallmethod()
+        if recording and not ownCo[coroutine.running()]
+            and (m == "FireServer" or m == "InvokeServer")
+            and typeof(self) == "Instance" then
+            local args = table.pack(...)
+            busyCo = coroutine.running()
+            if m == "InvokeServer" then
+                local res = table.pack(old(self, ...))
+                busyCo = nil
+                addRec(self, m, args, res)
+                return table.unpack(res, 1, res.n)
+            end
+            addRec(self, m, args)
+            local r = table.pack(old(self, ...))
+            busyCo = nil
+            return table.unpack(r, 1, r.n)
+        end
+        return old(self, ...)
+    end))
+    hooked = true
+end
+
+-- lớp hook thứ hai: bắt cả các lệnh gọi không đi qua __namecall
+if hookfunction then
+    pcall(function()
+        local ev, fn = Instance.new("RemoteEvent"), Instance.new("RemoteFunction")
+        local oldFire, oldInvoke
+        oldFire = hookfunction(ev.FireServer, nc(function(self, ...)
+            if recording and not ownCo[coroutine.running()] and busyCo ~= coroutine.running()
+                and typeof(self) == "Instance" then
+                addRec(self, "FireServer", table.pack(...))
+            end
+            return oldFire(self, ...)
+        end))
+        oldInvoke = hookfunction(fn.InvokeServer, nc(function(self, ...)
+            if recording and not ownCo[coroutine.running()] and busyCo ~= coroutine.running()
+                and typeof(self) == "Instance" then
+                local args = table.pack(...)
+                local res = table.pack(oldInvoke(self, ...))
+                addRec(self, "InvokeServer", args, res)
+                return table.unpack(res, 1, res.n)
+            end
+            return oldInvoke(self, ...)
+        end))
+        hooked = true
+    end)
+end
+
+-- ===== ABILITIES TRONG MACRO (khối do...end: không thêm local cấp cao) =====
+do
+    local VIMa = nil
+    pcall(function() VIMa = game:GetService("VirtualInputManager") end)
+    local GSa = game:GetService("GuiService")
+
+    local function cleanTxt(t) return (t:lower():gsub("[%p%s]+$", "")) end
+
+    -- tìm khung "Abilities" đang hiện: trả về nhãn và khung chứa
+    local function findCard()
+        local pg = LP:FindFirstChild("PlayerGui")
+        if not pg then return end
+        for _, o in ipairs(pg:GetDescendants()) do
+            if o:IsA("TextLabel") and o.Text ~= "" and #o.Text < 30
+                and cleanTxt(o.Text) == "abilities" and isShown(o) then
+                local card, a, n = o, o.Parent, 0
+                while a and a:IsA("GuiObject") and n < 3 do
+                    local sz = a.AbsoluteSize
+                    if sz.X > 400 or sz.Y > 220 then break end
+                    card = a
+                    a = a.Parent
+                    n += 1
+                end
+                return o, card
+            end
+        end
+    end
+
+    -- phát lại: bấm vào đúng vị trí tương đối trong khung Abilities
+    remoteCache["\0ui"] = function(fx, fy)
+        local _, card = findCard()
+        if not card then return false, "không thấy khung Abilities" end
+        local ap, sz = card.AbsolutePosition, card.AbsoluteSize
+        local px, py = ap.X + sz.X * (fx or 0.5), ap.Y + sz.Y * (fy or 0.5)
+        local pg = LP:FindFirstChild("PlayerGui")
+        local target
+        if pg then
+            for _, o in ipairs(pg:GetGuiObjectsAtPosition(px, py)) do
+                local b = o
+                while b and b ~= pg and not b:IsA("GuiButton") do b = b.Parent end
+                if b and b:IsA("GuiButton") and isShown(b) then target = b break end
+            end
+        end
+        if target then
+            press(target)
+            return true
+        end
+        if VIMa then
+            local inset = GSa:GetGuiInset()
+            VIMa:SendMouseButtonEvent(px, py + inset.Y, 0, true, game, 0)
+            task.wait(0.05)
+            VIMa:SendMouseButtonEvent(px, py + inset.Y, 0, false, game, 0)
+            return true
+        end
+        return false, "không bấm được"
+    end
+
+    -- ghi: lần bấm vào khung Abilities lúc đang ghi macro (nếu game không có remote Abilities riêng)
+    UIS.InputBegan:Connect(function(input)
+        if not recording then return end
+        local ut = input.UserInputType
+        if ut ~= Enum.UserInputType.Touch and ut ~= Enum.UserInputType.MouseButton1 then return end
+        local x, y = input.Position.X, input.Position.Y
+        local tc, wv, wt = os.clock(), curWave, os.clock() - waveStart
+        local ok, _, card = pcall(findCard)
+        if not ok or not card then return end
+        local ap, sz = card.AbsolutePosition, card.AbsoluteSize
+        if x < ap.X or y < ap.Y or x > ap.X + sz.X or y > ap.Y + sz.Y then return end
+        local fx, fy = (x - ap.X) / math.max(sz.X, 1), (y - ap.Y) / math.max(sz.Y, 1)
+        task.delay(0.5, function()
+            if not recording then return end
+            -- game đã gửi remote Abilities riêng thì không ghi thêm lần bấm giao diện
+            for i = #rec, 1, -1 do
+                local e = rec[i]
+                if recStart + e.t < tc - 0.4 then break end
+                local ln = (e.name or ""):lower()
+                if ln:find("abilit", 1, true) or ln:find("skill", 1, true) or ln:find("ultimate", 1, true) then
+                    return
+                end
+            end
+            if #rec == 0 then recStart = tc end
+            local root = rootPart()
+            local step = {
+                t = tc - recStart, name = "UI:Abilities", method = "UIClick", args = { n = 0 },
+                kind = "other", pos = root and root.CFrame or nil,
+                wave = wv > 0 and wv or nil, wt = wt, fx = fx, fy = fy,
+            }
+            local at = #rec + 1
+            for i = 1, #rec do
+                if rec[i].t > step.t then at = i break end
+            end
+            table.insert(rec, at, step)
+            setStatus("Đã ghi " .. #rec .. " bước · Abilities (bấm giao diện)")
+            refreshRec()
+        end)
+    end)
+end
+
+-- ===== MACRO: PHÁT LẠI =====
+local runId = 0
+local runStarted = 0
+local function alive(id) return running and id == runId end
+
+local function short(v)
+    if type(v) == "table" then
+        return "{" .. tostring(v[1]) .. ", " .. tostring(v[2]) .. "}"
+    end
+    return tostring(v)
+end
+
+-- tìm lại unit (model) trong workspace theo tên + vị trí đã ghi
+local function resolveUnit(x)
+    local parent = x.parent and workspace:FindFirstChild(x.parent, true)
+    local list = parent and parent:GetChildren() or workspace:GetDescendants()
+    local best, bd
+    for _, m in ipairs(list) do
+        if m.Name == x.name and (m:IsA("Model") or m:IsA("BasePart")) then
+            local p = posOf(m)
+            if p then
+                local d = (p - x.pos).Magnitude
+                if not bd or d < bd then best, bd = m, d end
+            end
+        end
+    end
+    if best and bd < 8 then return best end
+end
+
+local function waitForStep(id, e, t0, i, n)
+    if S.waveSync and e.wave and curWave > 0 then
+        local lastMsg = 0
+        while alive(id) and curWave < e.wave do
+            if os.clock() - lastMsg > 1 then
+                lastMsg = os.clock()
+                setStatus(("Vòng %d · bước %d/%d · chờ wave %d (đang wave %d)"):format(n, i, #rec, e.wave, curWave))
+            end
+            task.wait(0.25)
+        end
+        if curWave == e.wave then
+            while alive(id) do
+                local w = (e.wt or 0) - (os.clock() - waveStart)
+                if w <= 0 then break end
+                setStatus(("Vòng %d · bước %d/%d · chờ %ds trong wave %d"):format(n, i, #rec, math.ceil(w), e.wave))
+                task.wait(math.min(w, 0.5))
+            end
+        end
+    else
+        while alive(id) do
+            local w = e.t - (os.clock() - t0)
+            if w <= 0 then break end
+            setStatus(("Vòng %d · bước %d/%d · chờ %ds"):format(n, i, #rec, math.ceil(w)))
+            task.wait(math.min(w, 0.5))
+        end
+    end
+end
+
+local function playOnce(id, n, skipPast)
+    local idMap = {}
+    local t0 = os.clock()
+    local okN, failN, firstFail = 0, 0, nil
+    local nowWave, nowWt = curWave, os.clock() - waveStart
+    for i, e in ipairs(rec) do
+        if not alive(id) then return okN, failN, firstFail end
+
+        local skip = false
+        if skipPast then
+            if e.wave and nowWave > 0 then
+                skip = e.wave < nowWave or (e.wave == nowWave and (e.wt or 0) <= nowWt + 1)
+            else
+                skip = true
+            end
+        end
+        if skip then
+            if e.placedId ~= nil then idMap[e.placedId] = e.placedId end -- unit đã có sẵn
+            logLine("Bước " .. i .. " bỏ qua (đã làm tay trong trận này)")
+            continue
+        end
+
+        waitForStep(id, e, t0, i, n)
+        if not alive(id) then return okN, failN, firstFail end
+
+        -- tới đúng vị trí đã ghi trước khi đặt / nâng / bán
+        if S.tpPlace and e.pos and e.kind and e.kind ~= "other" then
+            tpTo(e.pos)
+        end
+
+        if e.method == "UIClick" then
+            local fnU = remoteCache["\0ui"]
+            local okU, didU, whyU = ownCall(function() return fnU(e.fx, e.fy) end)
+            if okU and didU then
+                okN += 1
+                setStatus(("Vòng %d · bước %d/%d · Abilities"):format(n, i, #rec))
+                logLine("Bước " .. i .. " bấm Abilities")
+            else
+                failN += 1
+                firstFail = firstFail or ("Abilities: " .. tostring(whyU or didU or "lỗi"):sub(1, 60))
+                logLine("Bước " .. i .. " Abilities lỗi: " .. tostring(whyU or didU))
+            end
+            continue
+        end
+
+        local inst = e.inst
+        if not (inst and inst.Parent) then
+            inst = remote(e.name)
+            e.inst = inst
+        end
+
+        if not inst then
+            failN += 1
+            firstFail = firstFail or (e.name .. ": không tìm thấy remote")
+            logLine("Bước " .. i .. ": không thấy remote " .. e.name)
+        else
+            local maxTry = (e.placedId ~= nil or e.units) and 6 or 1
+            for try = 1, maxTry do
+                if not alive(id) then return okN, failN, firstFail end
+                local a = table.pack(table.unpack(e.args, 1, e.args.n))
+                if e.kind ~= "place" then
+                    for ai = 1, a.n do
+                        local v = a[ai]
+                        if (type(v) == "number" or type(v) == "string") and idMap[v] ~= nil then
+                            a[ai] = idMap[v]
+                        elseif type(v) == "table" then
+                            local c = {}
+                            for k, x in pairs(v) do
+                                if (type(x) == "number" or type(x) == "string") and idMap[x] ~= nil then
+                                    c[k] = idMap[x]
+                                else
+                                    c[k] = x
+                                end
+                            end
+                            a[ai] = c
+                        end
+                    end
+                elseif (type(a[1]) == "number" or type(a[1]) == "string") and idMap[a[1]] ~= nil then
+                    a[1] = idMap[a[1]]
+                end
+
+                -- gắn lại unit (model) đã ghi bằng vị trí
+                local missing = false
+                if e.units then
+                    for _, x in ipairs(e.units) do
+                        local u = resolveUnit(x)
+                        if u then a[x.i] = u else missing = true end
+                    end
+                end
+
+                if missing then
+                    if try == maxTry then
+                        failN += 1
+                        firstFail = firstFail or (e.name .. ": không tìm thấy unit " .. tostring(e.unit))
+                        logLine("Bước " .. i .. ": không thấy unit " .. tostring(e.unit))
+                    else
+                        task.wait(0.6)
+                    end
+                else
+                    local ok, res = ownCall(function()
+                        if e.method == "InvokeServer" then
+                            return table.pack(inst:InvokeServer(table.unpack(a, 1, a.n)))
+                        end
+                        inst:FireServer(table.unpack(a, 1, a.n))
+                    end)
+
+                    local r = ok and res and res[1]
+                    setStatus(("Vòng %d · bước %d/%d · %s → %s"):format(n, i, #rec, e.name, ok and short(r) or "LỖI"))
+                    logLine(("Bước %d %s(%s) → %s"):format(i, e.name, describeArgs(a), ok and short(r) or tostring(res)))
+
+                    if not ok then
+                        failN += 1
+                        firstFail = firstFail or (e.name .. ": " .. tostring(res):sub(1, 60))
+                        break
+                    end
+                    if e.placedId == nil then
+                        okN += 1
+                        break
+                    end
+                    local newId = extractId(res)
+                    if newId ~= nil then
+                        idMap[e.placedId] = newId
+                        okN += 1
+                        break
+                    end
+                    if try == maxTry then
+                        failN += 1
+                        firstFail = firstFail or (e.name .. " bị từ chối: " .. short(r))
+                    else
+                        task.wait(1.5)
+                    end
+                end
+            end
+        end
+    end
+    return okN, failN, firstFail
+end
+
+local function startMacro(skipPast)
+    if #rec == 0 then setStatus("Chưa có macro, hãy bấm Ghi macro trước") return end
+    runId += 1
+    local id = runId
+    running = true
+    runStarted = os.clock()
+    refreshRun()
+    local serial0 = matchSerial
+    task.spawn(function()
+        local n = 0
+        repeat
+            n += 1
+            local catchUp = skipPast and n == 1
+            local okN, failN, firstFail = playOnce(id, n, catchUp)
+            if alive(id) then
+                setStatus(("Vòng %d xong: ok %d · lỗi %d%s"):format(n, okN, failN,
+                    firstFail and (" · " .. firstFail) or ""))
+                if S.macroLoop then
+                    task.wait(S.cycle)
+                    -- Mỗi trận chỉ chạy macro một lần: làm xong thì đợi sang trận mới rồi mới lặp,
+                    -- không chạy lại từ đầu ngay trong trận đang chơi (tránh đặt lại unit đã bán)
+                    local lastMsg = 0
+                    while alive(id) and matchSerial == serial0 do
+                        if os.clock() - lastMsg > 1 then
+                            lastMsg = os.clock()
+                            setStatus(("Vòng %d xong, chờ trận mới để chạy tiếp"):format(n))
+                        end
+                        task.wait(0.5)
+                    end
+                    if alive(id) then
+                        serial0 = matchSerial
+                        task.wait(S.startDelay)
+                    end
+                end
+            end
+        until not alive(id) or not S.macroLoop
+        if id == runId then
+            running = false
+            refreshRun()
+        end
+    end)
+end
+
+local function stopMacro()
+    runId += 1
+    running = false
+    setStatus("Đã dừng")
+    refreshRun()
+end
+
+local function toggleRecord()
+    if not hooked then
+        setStatus("Executor không hỗ trợ hook, không ghi được")
+        return
+    end
+    recording = not recording
+    if recording then
+        stopMacro()
+        rec, recStart = {}, os.clock()
+        placedInfo = {}
+        seen, seenOrder, lastShown = {}, {}, ""
+        allLog = {}
+        setStatus("Đang ghi... hãy đặt / nâng / bán unit")
+    else
+        if #rec == 0 then
+            setStatus("Chưa ghi được bước nào. Bật 'Ghi mọi remote' rồi thử lại")
+        else
+            saveMacroFile()
+            if S.runAfterRec then
+                setStatus("Đã ghi xong và lưu, đang chạy macro")
+                startMacro(true)
+            else
+                setStatus("Đã ghi xong và lưu, bấm Chạy macro")
+            end
+        end
+    end
+    refreshRec()
+end
+
+local function toggleRun()
+    if recording then
+        recording = false
+        saveMacroFile()
+        refreshRec()
+        startMacro(true)
+        return
+    end
+    if running then stopMacro() else startMacro() end
+end
+
+-- Trận mới bắt đầu: tự chạy lại macro (chỉ khi phát hiện đổi trận, không phải đổi wave)
+local function onNewMatch()
+    if not S.macroAuto or #rec == 0 or recording then return end
+    if running and os.clock() - runStarted < 60 then return end -- đừng cắt macro vừa bắt đầu
+    local serial = matchSerial
+    runId += 1
+    running = false
+    refreshRun()
+    setStatus("Trận mới: chạy macro sau " .. S.startDelay .. " giây")
+    task.delay(S.startDelay, function()
+        if serial == matchSerial and not recording then startMacro() end
+    end)
+end
+
+-- ===== TỰ VÀO LẠI KHI MẤT KẾT NỐI + TỰ CHỌN MAP Ở SẢNH =====
+local GuiService = game:GetService("GuiService")
+local VIM = nil
+pcall(function() VIM = game:GetService("VirtualInputManager") end)
+local FILE_SELF = "ZaloHub_GTD.lua"
+local queueTp = queue_on_teleport or (syn and syn.queue_on_teleport) or (fluxus and fluxus.queue_on_teleport)
+
+-- Đăng ký để script tự chạy lại sau khi vào server mới (cần có file workspace/ZaloHub_GTD.lua)
+local function queueSelf()
+    if not queueTp then return false end
+    if not (canFile and isfile and isfile(FILE_SELF)) then return false end
+    pcall(queueTp, 'task.wait(3) loadstring(readfile("' .. FILE_SELF .. '"))()')
+    return true
+end
+
+local rejoining = false
+local function rejoin(reason)
+    if rejoining or not S.autoRejoin then return end
+    rejoining = true
+    local queued = queueSelf()
+    setStatus("Mất kết nối, đang vào lại" .. (queued and "" or " (chưa có file " .. FILE_SELF .. " nên script sẽ không tự chạy lại)"))
+    task.spawn(function()
+        for _ = 1, 40 do
+            pcall(function() TeleportService:Teleport(game.PlaceId, LP) end)
+            task.wait(10)
+        end
+        rejoining = false
+    end)
+end
+
+pcall(function()
+    GuiService.ErrorMessageChanged:Connect(function(msg)
+        if msg and msg ~= "" then rejoin(msg) end
+    end)
+end)
+task.spawn(function()
+    local ok, overlay = pcall(function()
+        local pg = game:GetService("CoreGui"):WaitForChild("RobloxPromptGui", 30)
+        return pg and pg:WaitForChild("promptOverlay", 30)
+    end)
+    if ok and overlay then
+        overlay.ChildAdded:Connect(function(c)
+            if c.Name == "ErrorPrompt" then rejoin("ErrorPrompt") end
+        end)
+    end
+end)
+pcall(function()
+    LP.OnTeleport:Connect(function()
+        if S.autoRejoin then queueSelf() end
+    end)
+end)
+
+local function trim(t) return (t:gsub("^%s+", ""):gsub("%s+$", "")) end
+
+-- chuẩn hóa chữ: bỏ khoảng trắng đầu cuối, dấu câu ở cuối (ví dụ "Start Game!"), không phân biệt hoa thường
+local function norm(t) return (trim(t):lower():gsub("[%p%s]+$", "")) end
+
+-- tìm nhãn / nút đang hiện có đúng chữ; ưu tiên cái nằm trong một nút bấm thật
+local function findLabel(want)
+    local pg = LP:FindFirstChild("PlayerGui")
+    if not pg then return end
+    want = norm(want)
+    local fallback
+    for _, o in ipairs(pg:GetDescendants()) do
+        if (o:IsA("TextLabel") or o:IsA("TextButton")) and o.Text ~= "" and #o.Text < 40
+            and norm(o.Text) == want and isShown(o) then
+            local b = o
+            while b and b ~= pg and not b:IsA("GuiButton") do b = b.Parent end
+            if b and b:IsA("GuiButton") then return o end
+            fallback = fallback or o
+        end
+    end
+    return fallback
+end
+
+local function clickAt(o)
+    if not VIM then return false end
+    return pcall(function()
+        local p = o.AbsolutePosition + o.AbsoluteSize / 2
+        local inset = GuiService:GetGuiInset()
+        VIM:SendMouseButtonEvent(p.X, p.Y + inset.Y, 0, true, game, 0)
+        task.wait(0.05)
+        VIM:SendMouseButtonEvent(p.X, p.Y + inset.Y, 0, false, game, 0)
+    end)
+end
+
+-- lần lẻ: bắn tín hiệu nút; lần chẵn: bấm giả vào đúng vị trí (phòng khi game chỉ nhận chạm thật)
+local function activate(o, attempt)
+    local pg = LP:FindFirstChild("PlayerGui")
+    local b = o
+    while b and b ~= pg and not b:IsA("GuiButton") do b = b.Parent end
+    local isBtn = b and b:IsA("GuiButton")
+    if isBtn and attempt % 2 == 1 then
+        press(b)
+        return true
+    end
+    return clickAt(isBtn and b or o)
+end
+
+-- các bục "Pick a map!" trong sảnh: { pos, n (số người tối đa), text }
+local function findPads()
+    local pads, seenGui = {}, {}
+    local function scan(root)
+        for _, o in ipairs(root:GetDescendants()) do
+            if o:IsA("TextLabel") and #o.Text < 30 and o.Text:lower():find("pick a map", 1, true) then
+                local g = o:FindFirstAncestorWhichIsA("LayerCollector")
+                if g and not seenGui[g] then
+                    seenGui[g] = true
+                    local okA, ad = pcall(function() return g.Adornee end)
+                    local part = (okA and ad) or (g.Parent and (g.Parent:IsA("BasePart") or g.Parent:IsA("Model")) and g.Parent)
+                    local pos = part and posOf(part)
+                    local n
+                    for _, d in ipairs(g:GetDescendants()) do
+                        if d:IsA("TextLabel") then
+                            local mx = trim(d.Text):match("^%d+%s*/%s*(%d+)$")
+                            if mx then n = tonumber(mx) break end
+                        end
+                    end
+                    if pos then pads[#pads + 1] = { pos = pos, n = n, part = part } end
+                end
+            end
+        end
+    end
+    pcall(scan, workspace)
+    local pg = LP:FindFirstChild("PlayerGui")
+    if pg then pcall(scan, pg) end
+    return pads
+end
+
+local function choosePad()
+    local root = rootPart()
+    if not root then return end
+    local best, bd, bestAny, bdAny
+    for _, pd in ipairs(findPads()) do
+        local d = (pd.pos - root.Position).Magnitude
+        if not bdAny or d < bdAny then bestAny, bdAny = pd, d end
+        if pd.n == S.lobbyPlayers and (not bd or d < bd) then best, bd = pd, d end
+    end
+    return best or bestAny
+end
+
+local lobbyAttempt, lobbyCool, padToggle = 0, 0, false
+local function inLobby() return (os.clock() - lastPresent) > 8 end
+
+local function lobbyStep()
+    if not S.autoLobby or recording or not inLobby() then return end
+    if os.clock() < lobbyCool or not rootPart() then return end
+    lobbyAttempt += 1
+    local a = lobbyAttempt
+
+    -- 1) màn chọn map đang mở
+    local create = findLabel("create lobby")
+    if create then
+        for _, want in ipairs({ S.mapName, S.mapMode, "Level " .. S.mapLevel }) do
+            local lbl = findLabel(want)
+            if lbl then
+                activate(lbl, a)
+                task.wait(0.5)
+            end
+        end
+        activate(create, a)
+        setStatus(("Chọn %s · %s · Level %d, đã bấm Create Lobby"):format(S.mapName, S.mapMode, S.mapLevel))
+        lobbyCool = os.clock() + 6
+        return
+    end
+
+    -- 2) hộp "Pick Map"
+    local pick = findLabel("pick map")
+    if pick then
+        activate(pick, a)
+        setStatus("Bấm Pick Map")
+        return
+    end
+
+    -- 3) nút bắt đầu (nếu game cần bấm sau khi tạo phòng)
+    for _, w in ipairs({ "start game", "start" }) do
+        local st = findLabel(w)
+        if st then
+            activate(st, a)
+            setStatus("Bấm " .. w)
+            lobbyCool = os.clock() + 4
+            return
+        end
+    end
+
+    -- 4) đi tới bục chọn map
+    local pad = choosePad()
+    if pad then
+        padToggle = not padToggle
+        -- lần sau bước ra rồi bước vào lại để chắc chắn kích hoạt bục
+        tpTo(CFrame.new(pad.pos + (padToggle and Vector3.new(0, 3, 0) or Vector3.new(0, 3, 10))))
+        setStatus(("Tới bục chọn map (%s người)"):format(tostring(pad.n or "?")))
+    else
+        setStatus("Không thấy bục 'Pick a map!' trong sảnh")
+    end
+end
+
+-- ===== GIAO DIỆN =====
+pcall(function()
+    local parent = (gethui and gethui()) or game:GetService("CoreGui")
+    local old = parent:FindFirstChild("ZaloHub")
+    if old then old:Destroy() end
+end)
+pcall(function()
+    local old = LP:WaitForChild("PlayerGui"):FindFirstChild("ZaloHub")
+    if old then old:Destroy() end
+end)
+
+local C = {
+    bg = Color3.fromRGB(16, 16, 18), side = Color3.fromRGB(22, 22, 25),
+    row = Color3.fromRGB(30, 30, 34), acc = Color3.fromRGB(255, 170, 0),
+    title = Color3.fromRGB(255, 214, 0), txt = Color3.fromRGB(240, 240, 240),
+    dim = Color3.fromRGB(150, 150, 158), red = Color3.fromRGB(215, 60, 60),
+    dark = Color3.fromRGB(20, 20, 20),
+}
+
+local function new(class, props, parent)
+    local o = Instance.new(class)
+    for k, v in pairs(props) do o[k] = v end
+    o.Parent = parent
+    return o
+end
+local function corner(o, r) new("UICorner", { CornerRadius = UDim.new(0, r or 6) }, o) end
+
+local gui = new("ScreenGui", { Name = "ZaloHub", ResetOnSpawn = false, DisplayOrder = 999 }, nil)
+local okParent = pcall(function() gui.Parent = (gethui and gethui()) or game:GetService("CoreGui") end)
+if not okParent or not gui.Parent then gui.Parent = LP:WaitForChild("PlayerGui") end
+
+local main = new("Frame", {
+    Size = UDim2.new(0, 580, 0, 310), Position = UDim2.new(0.5, -290, 0.5, -155),
+    BackgroundColor3 = C.bg, BackgroundTransparency = 0.08, BorderSizePixel = 0,
+}, gui)
+corner(main, 10)
+
+local top = new("Frame", { Size = UDim2.new(1, 0, 0, 34), BackgroundTransparency = 1 }, main)
+new("TextLabel", {
+    Size = UDim2.new(1, -50, 1, 0), Position = UDim2.new(0, 14, 0, 0), BackgroundTransparency = 1,
+    Text = '<font color="#FFD600">Zalo Hub</font>  -  Garden Tower Defense', RichText = true,
+    TextColor3 = C.txt, TextSize = 16, Font = Enum.Font.GothamBold, TextXAlignment = Enum.TextXAlignment.Left,
+}, top)
+local closeBtn = new("TextButton", {
+    Size = UDim2.new(0, 34, 0, 34), Position = UDim2.new(1, -34, 0, 0), BackgroundTransparency = 1,
+    Text = "✕", TextColor3 = C.txt, TextSize = 16, Font = Enum.Font.GothamBold,
+}, top)
+
+-- Nút mở lại giao diện: biểu tượng Zalo
+local ICON = ""
+do
+    -- ảnh Zalo thật nhúng sẵn (PNG base64): tự ghi ra workspace lần đầu, không cần bỏ file thủ công
+    local ZALO_PNG = "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"
+    pcall(function()
+        if not (getcustomasset and isfile and writefile) then return end
+        if not isfile(FILE_ICON) then
+            local map = {}
+            local chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+            for i = 1, 64 do map[chars:byte(i)] = i - 1 end
+            local out, buf, bits = {}, 0, 0
+            for i = 1, #ZALO_PNG do
+                local v = map[ZALO_PNG:byte(i)]
+                if v then
+                    buf = buf * 64 + v
+                    bits += 6
+                    if bits >= 8 then
+                        bits -= 8
+                        local p2 = 2 ^ bits
+                        out[#out + 1] = string.char(math.floor(buf / p2))
+                        buf = buf % p2
+                    end
+                end
+            end
+            writefile(FILE_ICON, table.concat(out))
+        end
+        if isfile(FILE_ICON) then ICON = getcustomasset(FILE_ICON) end
+    end)
+end
+local ZALO_BLUE = Color3.fromRGB(0, 104, 255)
+local openBtn = new("ImageButton", {
+    Size = UDim2.new(0, 52, 0, 52), Position = UDim2.new(1, -68, 0, 60),
+    BackgroundColor3 = ZALO_BLUE, AutoButtonColor = false, Visible = false,
+    Image = ICON, ScaleType = Enum.ScaleType.Fit, BorderSizePixel = 0,
+}, gui)
+corner(openBtn, 13)
+if ICON == "" then
+    local inner = new("Frame", {
+        Size = UDim2.new(1, -7, 1, -9), Position = UDim2.new(0, 5, 0, 2),
+        BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0,
+    }, openBtn)
+    corner(inner, 14)
+    new("TextLabel", {
+        Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, Text = "Zalo",
+        TextColor3 = ZALO_BLUE, TextSize = 17, Font = Enum.Font.GothamBold,
+    }, inner)
+else
+    openBtn.BackgroundTransparency = 1
+end
+
+local function drag(handle, target)
+    local dragging, moved = false, false
+    local start, startPos
+    handle.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+            dragging, moved = true, false
+            start, startPos = i.Position, target.Position
+            i.Changed:Connect(function()
+                if i.UserInputState == Enum.UserInputState.End then dragging = false end
+            end)
+        end
+    end)
+    UIS.InputChanged:Connect(function(i)
+        if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement
+            or i.UserInputType == Enum.UserInputType.Touch) then
+            local d = i.Position - start
+            if d.Magnitude > 6 then moved = true end
+            target.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
+                startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        end
+    end)
+    return function() return moved end
+end
+drag(top, main)
+local iconMoved = drag(openBtn, openBtn)
+
+closeBtn.MouseButton1Click:Connect(function() main.Visible = false openBtn.Visible = true end)
+openBtn.MouseButton1Click:Connect(function()
+    if iconMoved() then return end
+    main.Visible = true
+    openBtn.Visible = false
+end)
+
+-- Bảng điều khiển macro thu nhỏ cạnh biểu tượng Zalo
+local mini = new("Frame", {
+    Size = UDim2.new(0, 150, 0, 58), Position = UDim2.new(1, -150, 1, 6),
+    BackgroundColor3 = C.bg, BackgroundTransparency = 0.1, BorderSizePixel = 0,
+}, openBtn)
+corner(mini, 8)
+miniRec = new("TextButton", {
+    Size = UDim2.new(0, 66, 0, 26), Position = UDim2.new(0, 6, 0, 5), BackgroundColor3 = C.row,
+    Text = "●", TextColor3 = C.txt, TextSize = 16, Font = Enum.Font.GothamBold, AutoButtonColor = false,
+}, mini)
+corner(miniRec, 6)
+miniRun = new("TextButton", {
+    Size = UDim2.new(0, 66, 0, 26), Position = UDim2.new(0, 78, 0, 5), BackgroundColor3 = C.acc,
+    Text = "▶", TextColor3 = C.dark, TextSize = 16, Font = Enum.Font.GothamBold, AutoButtonColor = false,
+}, mini)
+corner(miniRun, 6)
+miniStatus = new("TextLabel", {
+    Size = UDim2.new(1, -12, 0, 20), Position = UDim2.new(0, 6, 0, 34), BackgroundTransparency = 1,
+    Text = "", TextColor3 = C.dim, TextSize = 11, Font = Enum.Font.GothamMedium,
+    TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
+}, mini)
+miniRec.MouseButton1Click:Connect(function() toggleRecord() end)
+miniRun.MouseButton1Click:Connect(function() toggleRun() end)
+
+-- Sidebar
+local side = new("Frame", {
+    Size = UDim2.new(0, 170, 1, -40), Position = UDim2.new(0, 8, 0, 36),
+    BackgroundColor3 = C.side, BorderSizePixel = 0,
+}, main)
+corner(side, 8)
+
+local searchBar = new("Frame", {
+    Size = UDim2.new(1, -12, 0, 32), Position = UDim2.new(0, 6, 0, 6), BackgroundColor3 = C.row,
+}, side)
+corner(searchBar, 16)
+new("TextLabel", {
+    Size = UDim2.new(0, 28, 1, 0), Position = UDim2.new(0, 6, 0, 0), BackgroundTransparency = 1,
+    Text = "🔍", TextSize = 14, TextColor3 = C.txt,
+}, searchBar)
+local searchBox = new("TextBox", {
+    Size = UDim2.new(1, -40, 1, 0), Position = UDim2.new(0, 34, 0, 0), BackgroundTransparency = 1,
+    Text = "", PlaceholderText = "Tìm mục hoặc chức năng...", PlaceholderColor3 = C.dim,
+    TextColor3 = C.txt, TextSize = 12, Font = Enum.Font.GothamMedium, ClearTextOnFocus = false,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, searchBar)
+
+local tabList = new("ScrollingFrame", {
+    Size = UDim2.new(1, -8, 1, -48), Position = UDim2.new(0, 4, 0, 44), BackgroundTransparency = 1,
+    BorderSizePixel = 0, ScrollBarThickness = 2, AutomaticCanvasSize = Enum.AutomaticSize.Y,
+    CanvasSize = UDim2.new(0, 0, 0, 0),
+}, side)
+new("UIListLayout", { Padding = UDim.new(0, 2), SortOrder = Enum.SortOrder.LayoutOrder }, tabList)
+
+-- Panel phải
+local right = new("Frame", {
+    Size = UDim2.new(1, -194, 1, -40), Position = UDim2.new(0, 186, 0, 36), BackgroundColor3 = C.side,
+    BackgroundTransparency = 0.3, BorderSizePixel = 0,
+}, main)
+corner(right, 8)
+local pageTitle = new("TextLabel", {
+    Size = UDim2.new(1, -20, 0, 34), Position = UDim2.new(0, 12, 0, 2), BackgroundTransparency = 1,
+    Text = "", TextColor3 = C.txt, TextSize = 17, Font = Enum.Font.GothamBold,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, right)
+
+local tabs, order, orderCount = {}, {}, 0
+local function nextOrder() orderCount += 1 return orderCount end
+
+local function selectTab(name)
+    for n, t in pairs(tabs) do
+        t.page.Visible = (n == name)
+        t.bar.Visible = (n == name)
+        t.btn.TextColor3 = (n == name) and C.txt or C.dim
+    end
+    pageTitle.Text = name
+end
+
+local function addTab(name)
+    local btn = new("TextButton", {
+        Size = UDim2.new(1, 0, 0, 34), BackgroundTransparency = 1, Text = "   " .. name,
+        TextColor3 = C.dim, TextSize = 14, Font = Enum.Font.GothamBold,
+        TextXAlignment = Enum.TextXAlignment.Left, LayoutOrder = nextOrder(),
+    }, tabList)
+    local bar = new("Frame", {
+        Size = UDim2.new(0, 3, 0, 20), Position = UDim2.new(0, 2, 0.5, -10),
+        BackgroundColor3 = C.acc, BorderSizePixel = 0, Visible = false,
+    }, btn)
+    corner(bar, 2)
+    local page = new("ScrollingFrame", {
+        Size = UDim2.new(1, -16, 1, -44), Position = UDim2.new(0, 8, 0, 38), BackgroundTransparency = 1,
+        BorderSizePixel = 0, ScrollBarThickness = 3, Visible = false,
+        AutomaticCanvasSize = Enum.AutomaticSize.Y, CanvasSize = UDim2.new(0, 0, 0, 0),
+    }, right)
+    new("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, page)
+    local T = { btn = btn, bar = bar, page = page, rows = {}, name = name }
+    tabs[name] = T
+    order[#order + 1] = name
+    btn.MouseButton1Click:Connect(function() selectTab(name) end)
+    return T
+end
+
+local function applyFilter()
+    local q = searchBox.Text:lower()
+    for name, T in pairs(tabs) do
+        local any = false
+        for _, r in ipairs(T.rows) do
+            local show
+            if q == "" then
+                show = true
+            elseif r.header then
+                show = false
+            else
+                show = r.name:find(q, 1, true) ~= nil
+            end
+            r.frame.Visible = show
+            if show and not r.header then any = true end
+        end
+        T.btn.Visible = q == "" or name:lower():find(q, 1, true) ~= nil or any
+    end
+end
+searchBox:GetPropertyChangedSignal("Text"):Connect(applyFilter)
+
+-- Các loại hàng
+local pendingKey = nil
+local function K(k) pendingKey = k end
+
+local function row(T, text, h)
+    local f = new("Frame", {
+        Size = UDim2.new(1, -6, 0, h or 38), BackgroundColor3 = C.row, BorderSizePixel = 0,
+        LayoutOrder = nextOrder(),
+    }, T.page)
+    corner(f, 6)
+    local lbl = new("TextLabel", {
+        Size = UDim2.new(1, -70, 0, h and math.min(h, 38) or 38), Position = UDim2.new(0, 12, 0, 0),
+        BackgroundTransparency = 1, Text = text, TextColor3 = C.txt, TextSize = 13,
+        Font = Enum.Font.GothamBold, TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    }, f)
+    T.rows[#T.rows + 1] = { frame = f, name = text:lower() }
+    return f, lbl
+end
+
+local function header(T, text)
+    local f = new("Frame", {
+        Size = UDim2.new(1, -6, 0, 30), BackgroundTransparency = 1, LayoutOrder = nextOrder(),
+    }, T.page)
+    new("TextLabel", {
+        Size = UDim2.new(1, 0, 1, -4), BackgroundTransparency = 1, Text = text,
+        TextColor3 = C.txt, TextSize = 14, Font = Enum.Font.GothamBold,
+    }, f)
+    new("Frame", {
+        Size = UDim2.new(1, 0, 0, 2), Position = UDim2.new(0, 0, 1, -2),
+        BackgroundColor3 = C.acc, BackgroundTransparency = 0.35, BorderSizePixel = 0,
+    }, f)
+    T.rows[#T.rows + 1] = { frame = f, name = text:lower(), header = true }
+end
+
+local function toggle(T, text, init, cb)
+    local key = pendingKey
+    pendingKey = nil
+    local f = row(T, text)
+    local box = new("TextButton", {
+        Size = UDim2.new(0, 26, 0, 26), Position = UDim2.new(1, -38, 0.5, -13),
+        BackgroundColor3 = C.row, Text = init and "✓" or "", TextColor3 = C.acc, TextSize = 18,
+        Font = Enum.Font.GothamBold, AutoButtonColor = false,
+    }, f)
+    corner(box, 5)
+    new("UIStroke", { Color = C.acc, Thickness = 2 }, box)
+    local state = init
+    if key then
+        setters[key] = function(v)
+            state = v
+            box.Text = v and "✓" or ""
+        end
+    end
+    box.MouseButton1Click:Connect(function()
+        state = not state
+        box.Text = state and "✓" or ""
+        cb(state)
+    end)
+end
+
+local function dropdown(T, text, options, idx, cb)
+    local key = pendingKey
+    pendingKey = nil
+    local f, lbl = row(T, text .. ": " .. options[idx])
+    local base = text
+    if key then
+        setters[key] = function(v)
+            idx = math.clamp(v, 1, #options)
+            lbl.Text = base .. ": " .. options[idx]
+        end
+    end
+    new("TextLabel", {
+        Size = UDim2.new(0, 30, 1, 0), Position = UDim2.new(1, -34, 0, 0), BackgroundTransparency = 1,
+        Text = "›", TextColor3 = C.txt, TextSize = 26, Font = Enum.Font.GothamBold,
+    }, f)
+    local hit = new("TextButton", { Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, Text = "" }, f)
+    hit.MouseButton1Click:Connect(function()
+        idx = idx % #options + 1
+        lbl.Text = base .. ": " .. options[idx]
+        cb(idx)
+    end)
+end
+
+local function slider(T, text, min, max, init, cb)
+    local key = pendingKey
+    pendingKey = nil
+    local f = row(T, text, 54)
+    local box = new("TextBox", {
+        Size = UDim2.new(0, 70, 0, 24), Position = UDim2.new(1, -82, 0, 7),
+        BackgroundColor3 = Color3.fromRGB(20, 20, 23),
+        Text = tostring(init), TextColor3 = C.txt, TextSize = 13, Font = Enum.Font.GothamMedium,
+        ClearTextOnFocus = false,
+    }, f)
+    corner(box, 5)
+    local track = new("Frame", {
+        Size = UDim2.new(1, -24, 0, 6), Position = UDim2.new(0, 12, 1, -14),
+        BackgroundColor3 = Color3.fromRGB(55, 55, 60), BorderSizePixel = 0,
+    }, f)
+    corner(track, 3)
+    local fill = new("Frame", {
+        Size = UDim2.new((init - min) / (max - min), 0, 1, 0), BackgroundColor3 = C.acc, BorderSizePixel = 0,
+    }, track)
+    corner(fill, 3)
+
+    local function setVal(v)
+        v = math.clamp(math.floor(v + 0.5), min, max)
+        fill.Size = UDim2.new((v - min) / (max - min), 0, 1, 0)
+        box.Text = tostring(v)
+        cb(v)
+    end
+    if key then setters[key] = setVal end
+    local dragging = false
+    local function upd(i)
+        local rel = (i.Position.X - track.AbsolutePosition.X) / math.max(track.AbsoluteSize.X, 1)
+        setVal(min + math.clamp(rel, 0, 1) * (max - min))
+    end
+    track.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            upd(i)
+        end
+    end)
+    UIS.InputChanged:Connect(function(i)
+        if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement
+            or i.UserInputType == Enum.UserInputType.Touch) then
+            upd(i)
+        end
+    end)
+    UIS.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+    box.FocusLost:Connect(function() setVal(tonumber(box.Text) or init) end)
+end
+
+local function button(T, text, cb, accent)
+    local f, lbl = row(T, text)
+    lbl.Size = UDim2.new(1, 0, 1, 0)
+    lbl.Position = UDim2.new(0, 0, 0, 0)
+    lbl.TextXAlignment = Enum.TextXAlignment.Center
+    if accent then
+        f.BackgroundColor3 = C.acc
+        lbl.TextColor3 = C.dark
+    end
+    local hit = new("TextButton", { Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, Text = "" }, f)
+    hit.MouseButton1Click:Connect(function() pcall(cb) end)
+    return lbl, f
+end
+
+local function note(T, text, h)
+    local f, lbl = row(T, text, h or 44)
+    lbl.Size = UDim2.new(1, -20, 1, 0)
+    lbl.TextWrapped = true
+    lbl.TextTruncate = Enum.TextTruncate.None
+    lbl.Font = Enum.Font.Gotham
+    lbl.TextSize = 12
+    lbl.TextColor3 = C.dim
+    return lbl
+end
+
+local function textInput(T, text, init, cb)
+    local key = pendingKey
+    pendingKey = nil
+    local f = row(T, text)
+    local box = new("TextBox", {
+        Size = UDim2.new(0, 150, 0, 26), Position = UDim2.new(1, -162, 0.5, -13),
+        BackgroundColor3 = Color3.fromRGB(20, 20, 23), Text = init, TextColor3 = C.txt,
+        TextSize = 13, Font = Enum.Font.GothamMedium, ClearTextOnFocus = false,
+        PlaceholderText = "Dán vào đây...", PlaceholderColor3 = C.dim, TextTruncate = Enum.TextTruncate.AtEnd,
+    }, f)
+    corner(box, 5)
+    if key then setters[key] = function(v) box.Text = v end end
+    box.FocusLost:Connect(function() cb(box.Text) end)
+    return box
+end
+
+-- ===== MACRO (tab đầu tiên) =====
+local tMacro = addTab("Macro")
+header(tMacro, "Cách dùng (3 bước)")
+note(tMacro, "1) Bấm ●  Ghi macro   2) Tự đặt / nâng / bán unit trong game   3) Bấm ■  Dừng ghi rồi ▶  Chạy macro.  Macro tự lưu cả vị trí đứng, vị trí đặt, số lượng unit, nâng cấp, bán và cả nút Abilities (bấm lúc nào, chạy lại đúng wave và đúng giây đó). Đóng menu (✕) để dùng nút ● ▶ nhỏ cạnh biểu tượng Zalo.", 92)
+
+-- thống kê: tổng + theo từng unit
+local function statLines()
+    local p, u, sl, o = 0, 0, 0, 0
+    local per, ord = {}, {}
+    for _, e in ipairs(rec) do
+        local k = e.kind or kindOf(e.name)
+        if k == "place" then p += 1
+        elseif k == "upgrade" then u += 1
+        elseif k == "sell" then sl += 1
+        else o += 1 end
+        if e.unit and k ~= "other" then
+            local s = per[e.unit]
+            if not s then
+                s = { place = 0, upgrade = 0, sell = 0 }
+                per[e.unit] = s
+                ord[#ord + 1] = e.unit
+            end
+            s[k] += 1
+        end
+    end
+    local total = ("Bản ghi: đặt %d · nâng %d · bán %d · khác %d"):format(p, u, sl, o)
+    local lines = {}
+    for i, name in ipairs(ord) do
+        if i > 4 then
+            lines[#lines + 1] = "... và " .. (#ord - 4) .. " unit nữa"
+            break
+        end
+        local s = per[name]
+        lines[#lines + 1] = ("• %s: đặt %d / nâng %d / bán %d"):format(name, s.place, s.upgrade, s.sell)
+    end
+    return total, (#lines > 0 and table.concat(lines, "\n") or "Chưa có thống kê theo unit")
+end
+
+setStatus = function(t)
+    if t then statusMsg = t end
+    local total, units = statLines()
+    if statusLbl then statusLbl.Text = statusMsg .. "\n" .. total end
+    if unitLbl then unitLbl.Text = units end
+    if miniStatus then miniStatus.Text = statusMsg end
+end
+
+refreshRec = function()
+    if recLbl then recLbl.Text = recording and "■  Dừng ghi" or "●  Ghi macro" end
+    if recFrame then recFrame.BackgroundColor3 = recording and C.red or C.row end
+    if miniRec then
+        miniRec.Text = recording and "■" or "●"
+        miniRec.BackgroundColor3 = recording and C.red or C.row
+    end
+end
+
+refreshRun = function()
+    if runLbl then
+        runLbl.Text = running and "■  Dừng macro" or "▶  Chạy macro"
+        runLbl.TextColor3 = running and C.txt or C.dark
+    end
+    if runFrame then runFrame.BackgroundColor3 = running and C.red or C.acc end
+    if miniRun then
+        miniRun.Text = running and "■" or "▶"
+        miniRun.BackgroundColor3 = running and C.red or C.acc
+        miniRun.TextColor3 = running and C.txt or C.dark
+    end
+end
+
+local function oneTouch()
+    for k, v in pairs({ autoSpeed = true, autoSkip = true, autoReplay = true, macroAuto = true, macroLoop = true, autoRejoin = true, autoLobby = true }) do
+        S[k] = v
+        if setters[k] then setters[k](v) end
+    end
+    fire("SetAutoSkip", true)
+    if #rec > 0 then
+        startMacro()
+    else
+        setStatus("Auto Farm đã bật, nhưng chưa có macro để chạy")
+    end
+end
+
+header(tMacro, "Điều khiển")
+statusLbl = note(tMacro, "", 62)
+unitLbl = note(tMacro, "", 84)
+statusMsg = (hooked and "Sẵn sàng" or "Executor không hỗ trợ hook, không ghi được")
+if loadedSteps > 0 then
+    statusMsg = statusMsg .. " · đã nạp macro đã lưu (" .. loadedSteps .. " bước)"
+end
+
+recLbl, recFrame = button(tMacro, "●  Ghi macro", toggleRecord)
+runLbl, runFrame = button(tMacro, "▶  Chạy macro", toggleRun, true)
+button(tMacro, "⚡  Bật Auto Farm (1 chạm)", oneTouch)
+button(tMacro, "Xóa bản ghi", function()
+    rec = {}
+    placedInfo = {}
+    recording = false
+    stopMacro()
+    if canFile and delfile and isfile and isfile(FILE_MACRO) then pcall(delfile, FILE_MACRO) end
+    setStatus("Đã xóa bản ghi")
+    refreshRec()
+end)
+
+-- ===== THƯ VIỆN MACRO: lưu được nhiều bản (khối do...end: không thêm local cấp cao) =====
+do
+    local FILE_LIB = "ZaloHub_GTD_macros.json"
+    local lib = {}
+    do
+        local raw = loadFile(FILE_LIB)
+        if raw then
+            local ok, obj = pcall(function() return HttpService:JSONDecode(raw) end)
+            if ok and type(obj) == "table" and obj.kind == "gtd_macro_lib" and type(obj.list) == "table" then
+                lib = obj.list
+            end
+        end
+    end
+    local sel = 1
+    local function persist()
+        saveFile(FILE_LIB, HttpService:JSONEncode({ kind = "gtd_macro_lib", list = lib }))
+    end
+
+    header(tMacro, "Thư viện macro (lưu nhiều bản)")
+    note(tMacro, canFile
+        and "Gõ tên rồi bấm Lưu để cất macro hiện tại. Bấm dòng 'Chọn macro' để đổi sang bản khác, rồi Nạp hoặc Xóa. Trùng tên sẽ ghi đè bản cũ. Thư viện lưu trong workspace/ZaloHub_GTD_macros.json."
+        or "Executor không ghi được file nên thư viện chỉ giữ đến khi tắt game. Gõ tên rồi bấm Lưu; bấm dòng 'Chọn macro' để đổi bản.", 70)
+    local nameBox = textInput(tMacro, "Tên macro", "", function() end)
+    nameBox.PlaceholderText = "Gõ tên..."
+
+    local selFrame, selLbl = row(tMacro, "Chọn macro")
+    new("TextLabel", {
+        Size = UDim2.new(0, 30, 1, 0), Position = UDim2.new(1, -34, 0, 0), BackgroundTransparency = 1,
+        Text = "›", TextColor3 = C.txt, TextSize = 26, Font = Enum.Font.GothamBold,
+    }, selFrame)
+    local selHit = new("TextButton", { Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, Text = "" }, selFrame)
+
+    local function refreshSel()
+        if #lib == 0 then
+            selLbl.Text = "Chọn macro: (thư viện trống)"
+            return
+        end
+        sel = math.clamp(sel, 1, #lib)
+        local m = lib[sel]
+        selLbl.Text = ("Chọn macro: %s · %d bước [%d/%d]"):format(tostring(m.name), tonumber(m.n) or 0, sel, #lib)
+    end
+    selHit.MouseButton1Click:Connect(function()
+        if #lib == 0 then return end
+        sel = sel % #lib + 1
+        refreshSel()
+    end)
+
+    button(tMacro, "Lưu macro hiện tại vào thư viện", function()
+        if #rec == 0 then setStatus("Chưa có bản ghi để lưu vào thư viện") return end
+        local nm = trim(nameBox.Text)
+        if nm == "" then nm = "Macro " .. (#lib + 1) end
+        local entry = { name = nm, n = #rec, data = macroToTable(), saved = os.time() }
+        local at
+        for i, m in ipairs(lib) do
+            if m.name == nm then at = i break end
+        end
+        if at then
+            lib[at] = entry
+        else
+            lib[#lib + 1] = entry
+            at = #lib
+        end
+        sel = at
+        persist()
+        refreshSel()
+        setStatus(("Đã lưu '%s' vào thư viện (%d bước)"):format(nm, #rec))
+    end)
+
+    button(tMacro, "Nạp macro đã chọn", function()
+        local m = lib[sel]
+        if not m or type(m.data) ~= "table" then setStatus("Thư viện trống, hãy lưu macro trước") return end
+        stopMacro()
+        recording = false
+        local n = applyMacro(m.data)
+        saveMacroFile()
+        refreshRec()
+        setStatus(("Đã nạp '%s' (%d bước), bấm Chạy macro để dùng"):format(tostring(m.name), n))
+    end)
+
+    button(tMacro, "Xóa macro đã chọn khỏi thư viện", function()
+        local m = lib[sel]
+        if not m then setStatus("Thư viện trống") return end
+        table.remove(lib, sel)
+        persist()
+        refreshSel()
+        setStatus("Đã xóa '" .. tostring(m.name) .. "' khỏi thư viện")
+    end)
+
+    refreshSel()
+end
+
+header(tMacro, "Vị trí trong macro")
+K("runAfterRec") toggle(tMacro, "Dừng ghi là chạy luôn", S.runAfterRec, function(v) S.runAfterRec = v end)
+K("tpPlace") toggle(tMacro, "Tự tới vị trí đã ghi khi đặt / nâng / bán", S.tpPlace, function(v) S.tpPlace = v end)
+K("waveSync") toggle(tMacro, "Chờ đúng wave đã ghi (tắt nếu bị đứng chờ)", S.waveSync, function(v) S.waveSync = v end)
+note(tMacro, "Vị trí được lưu ngay trong macro khi bạn ghi, không cần lưu riêng.")
+
+header(tMacro, "Lặp và tự chạy")
+K("macroLoop") toggle(tMacro, "Lặp vô tận (mỗi trận chạy một lần)", S.macroLoop, function(v) S.macroLoop = v end)
+K("cycle") slider(tMacro, "Nghỉ giữa các vòng (giây)", 0, 60, S.cycle, function(v) S.cycle = v end)
+K("macroAuto") toggle(tMacro, "Tự chạy macro khi vào trận mới", S.macroAuto, function(v) S.macroAuto = v end)
+K("startDelay") slider(tMacro, "Chờ trước khi chạy (giây)", 0, 30, S.startDelay, function(v) S.startDelay = v end)
+note(tMacro, "Mẹo: cuối bản ghi nên bán unit để vòng sau đặt lại được. Macro nên ghi và chạy từ Wave 1.")
+
+header(tMacro, "Chẩn đoán ghi macro")
+K("recAll") toggle(tMacro, "Ghi mọi remote (chỉ bật khi ghi ra 0 bước)", S.recAll, function(v) S.recAll = v end)
+button(tMacro, "Sao chép danh sách remote đã thấy", function()
+    if #seenOrder == 0 then
+        setStatus("Chưa thấy remote nào: bấm Ghi macro rồi thao tác trong game")
+        return
+    end
+    local out = {}
+    for _, n in ipairs(seenOrder) do out[#out + 1] = n .. " x" .. seen[n] end
+    if copyFn then
+        copyFn(table.concat(out, "\n"))
+        setStatus("Đã sao chép " .. #out .. " remote")
+    else
+        setStatus("Remote: " .. table.concat(out, ", "))
+    end
+end)
+button(tMacro, "Sao chép nhật ký MỌI remote (kèm tham số)", function()
+    if #allLog == 0 then setStatus("Chưa có nhật ký: bấm Ghi macro rồi thao tác trong game") return end
+    if copyFn then
+        copyFn(table.concat(allLog, "\n"))
+        setStatus("Đã sao chép " .. #allLog .. " dòng nhật ký remote")
+    end
+end)
+button(tMacro, "Sao chép bản ghi chi tiết", function()
+    if #rec == 0 then setStatus("Chưa có bản ghi") return end
+    if copyFn then
+        copyFn(recToText())
+        setStatus("Đã sao chép bản ghi (" .. #rec .. " bước)")
+    end
+end)
+button(tMacro, "Sao chép nhật ký chạy macro", function()
+    if #runLog == 0 then setStatus("Chưa có nhật ký, hãy chạy macro trước") return end
+    if copyFn then
+        copyFn(table.concat(runLog, "\n"))
+        setStatus("Đã sao chép nhật ký (" .. #runLog .. " dòng)")
+    end
+end)
+
+-- ===== TELEPORT =====
+local tTele = addTab("Dịch chuyển")
+header(tTele, "Đi theo quái")
+K("followMobs") toggle(tTele, "Đi theo quái (con đi đầu)", S.followMobs, function(v)
+    S.followMobs = v
+    if not v then followGoal = nil end
+end)
+K("followMode") dropdown(tTele, "Kiểu đi", { "Dịch chuyển", "Lướt mượt" }, S.followMode, function(i) S.followMode = i end)
+K("followDist") slider(tTele, "Khoảng cách tới quái", 0, 60, S.followDist, function(v) S.followDist = v end)
+K("enemyName") textInput(tTele, "Thư mục quái", S.enemyName, function(t) S.enemyName = t end)
+note(tTele, "Để trống thì tự tìm thư mục quái (Entities...). Có thể nhập tên hoặc đường dẫn đầy đủ, ví dụ Workspace.Contexts.X.Entities.", 50)
+
+header(tTele, "Dịch chuyển nhanh")
+button(tTele, "Tới quái đi đầu", function()
+    local m = leadEnemy()
+    local p = m and posOf(m)
+    if not p then setStatus("Không thấy quái nào") return end
+    tpTo(CFrame.new(p + Vector3.new(0, 3, S.followDist)))
+    setStatus("Đã tới quái: " .. m.Name)
+end)
+
+local spotIdx = 0
+button(tTele, "Tới vị trí đặt unit kế tiếp (từ macro)", function()
+    local list = {}
+    for _, e in ipairs(rec) do
+        if e.kind == "place" and (e.pos or e.at) then list[#list + 1] = e end
+    end
+    if #list == 0 then
+        setStatus("Macro chưa có vị trí đặt unit")
+        return
+    end
+    spotIdx = spotIdx % #list + 1
+    local e = list[spotIdx]
+    tpTo(e.pos or CFrame.new(e.at + Vector3.new(0, 3, 0)))
+    setStatus(("Đã tới vị trí %d/%d: %s"):format(spotIdx, #list, e.unit or "Unit"))
+end)
+note(tTele, "Vị trí đặt unit lấy từ macro đã ghi, không cần lưu vị trí riêng nữa.")
+
+-- ===== AUTOMATION =====
+local tAuto = addTab("Tự động")
+header(tAuto, "Tốc độ trận")
+K("speed") dropdown(tAuto, "Tốc độ trận", { "x1", "x2", "x3" }, S.speed, function(i)
+    S.speed = i
+    fire("ChangeTickSpeed", i)
+end)
+K("autoSpeed") toggle(tAuto, "Tự chỉnh tốc độ trận", S.autoSpeed, function(v) S.autoSpeed = v end)
+K("autoSkip") toggle(tAuto, "Tự bỏ qua wave (Skip)", S.autoSkip, function(v)
+    S.autoSkip = v
+    fire("SetAutoSkip", v)
+end)
+header(tAuto, "Kết thúc trận")
+K("autoReplay") toggle(tAuto, "Tự chơi lại", S.autoReplay, function(v) S.autoReplay = v end)
+K("autoLeave") toggle(tAuto, "Tự rời về sảnh", S.autoLeave, function(v) S.autoLeave = v end)
+K("voteLevel") slider(tAuto, "Tự bầu Level (0 = tắt)", 0, 7, S.voteLevel, function(v) S.voteLevel = v end)
+header(tAuto, "Nâng cấp")
+K("upgradeAll") toggle(tAuto, "Tự nâng cấp tất cả (Upgrade all)", S.upgradeAll, function(v) S.upgradeAll = v end)
+
+header(tAuto, "Tự vào lại & chọn map")
+K("autoRejoin") toggle(tAuto, "Tự vào lại khi mất kết nối", S.autoRejoin, function(v) S.autoRejoin = v end)
+K("autoLobby") toggle(tAuto, "Tự chọn map ở sảnh rồi vào chơi", S.autoLobby, function(v) S.autoLobby = v end)
+local MAPS = { "Farm Frenzy", "Enchanted Encounter", "Tropical Takedown", "Radioactive Rampage",
+    "Graveyard Gauntlet", "Garden Grind", "Space Showdown", "Dojo Dynasty",
+    "Winter Wonderland", "Volcanic Vengeance", "Aqua Ambush" }
+local MODES = { "Classic", "Night" }
+S.mapIdx = math.clamp(S.mapIdx, 1, #MAPS)
+S.modeIdx = math.clamp(S.modeIdx, 1, #MODES)
+S.mapName, S.mapMode = MAPS[S.mapIdx], MODES[S.modeIdx]
+K("mapIdx") dropdown(tAuto, "Map", MAPS, S.mapIdx, function(i) S.mapIdx = i S.mapName = MAPS[i] end)
+K("modeIdx") dropdown(tAuto, "Chế độ", MODES, S.modeIdx, function(i) S.modeIdx = i S.mapMode = MODES[i] end)
+K("mapLevel") slider(tAuto, "Level", 1, 5, S.mapLevel, function(v) S.mapLevel = v end)
+K("lobbyPlayers") slider(tAuto, "Bục (số người tối đa)", 1, 4, S.lobbyPlayers, function(v) S.lobbyPlayers = v end)
+note(tAuto, "Muốn tự chạy lại script sau khi vào lại: lưu toàn bộ script thành file workspace/ZaloHub_GTD.lua (hoặc bỏ vào thư mục autoexec).", 62)
+button(tAuto, "Sao chép danh sách bục & nút ở sảnh (chẩn đoán)", function()
+    local out = { "== BỤC ==" }
+    for i, pd in ipairs(findPads()) do
+        out[#out + 1] = ("%d | n=%s | %.0f,%.0f,%.0f | %s"):format(i, tostring(pd.n), pd.pos.X, pd.pos.Y, pd.pos.Z,
+            pd.part and pd.part:GetFullName() or "?")
+    end
+    out[#out + 1] = "== NÚT / CHỮ ĐANG HIỆN =="
+    local pg = LP:FindFirstChild("PlayerGui")
+    if pg then
+        for _, o in ipairs(pg:GetDescendants()) do
+            if (o:IsA("TextLabel") or o:IsA("TextButton")) and o.Text ~= "" and #o.Text < 40 and isShown(o) then
+                out[#out + 1] = o.ClassName .. " | " .. o.Text .. " | " .. o:GetFullName():sub(-70)
+                if #out > 250 then break end
+            end
+        end
+    end
+    if copyFn then
+        copyFn(table.concat(out, "\n"))
+        setStatus("Đã sao chép " .. #out .. " dòng chẩn đoán sảnh")
+    end
+end)
+button(tAuto, "Thử chạy 1 bước chọn map ngay", function()
+    local was = S.autoLobby
+    S.autoLobby = true
+    lobbyCool = 0
+    local savedLast = lastPresent
+    lastPresent = os.clock() - 20 -- coi như đang ở sảnh để thử
+    pcall(lobbyStep)
+    lastPresent = savedLast
+    S.autoLobby = was
+end)
+
+-- ===== PLAYER =====
+local tPlayer = addTab("Người chơi")
+header(tPlayer, "Nhân vật")
+K("useWalk") toggle(tPlayer, "Bật tốc độ chạy", S.useWalk, function(v) S.useWalk = v end)
+K("walk") slider(tPlayer, "Tốc độ chạy", 16, 200, S.walk, function(v) S.walk = v end)
+K("useJump") toggle(tPlayer, "Bật lực nhảy", S.useJump, function(v) S.useJump = v end)
+K("jump") slider(tPlayer, "Lực nhảy", 50, 200, S.jump, function(v) S.jump = v end)
+K("infJump") toggle(tPlayer, "Nhảy vô hạn", S.infJump, function(v) S.infJump = v end)
+K("noclip") toggle(tPlayer, "Noclip (xuyên tường)", S.noclip, function(v) S.noclip = v end)
+header(tPlayer, "Phiên chơi")
+K("antiAFK") toggle(tPlayer, "Chống treo máy (Anti AFK)", S.antiAFK, function(v) S.antiAFK = v end)
+button(tPlayer, "Vào lại server", function() TeleportService:Teleport(game.PlaceId, LP) end)
+button(tPlayer, "Reset nhân vật", function()
+    local h = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
+    if h then h.Health = 0 end
+end)
+
+-- ===== PERFORMANCE =====
+local tPerf = addTab("Hiệu năng")
+header(tPerf, "Tốc độ khung hình")
+slider(tPerf, "Giới hạn FPS", 15, 240, 60, function(v) if setfpscap then setfpscap(v) end end)
+toggle(tPerf, "Tạm dừng vẽ 3D", false, function(v) RunService:Set3dRenderingEnabled(not v) end)
+header(tPerf, "Ánh sáng & hiệu ứng")
+toggle(tPerf, "Giảm ánh sáng", false, function(v)
+    Lighting.GlobalShadows = not v
+    if v then Lighting.Brightness = 1 end
+end)
+K("noEffects") toggle(tPerf, "Tắt hiệu ứng & hạt", S.noEffects, function(v) S.noEffects = v end)
+K("hidePlayers") toggle(tPerf, "Ẩn người chơi khác", S.hidePlayers, function(v) S.hidePlayers = v end)
+
+-- ===== SETTINGS: COPY / PASTE =====
+local tSet = addTab("Cài đặt")
+header(tSet, "Tự động lưu")
+note(tSet, canFile
+    and "Macro tự lưu vào workspace/ZaloHub_GTD_macro.json, cài đặt lưu vào ZaloHub_GTD_config.json. Nút mở menu dùng ảnh Zalo thật nhúng sẵn trong script (tự ghi ra workspace)."
+    or "Executor không hỗ trợ writefile/readfile nên không tự lưu được, hãy dùng Sao chép / Dán bên dưới.", 62)
+header(tSet, "Sao chép")
+local setLbl = note(tSet, copyFn and "Bấm Sao chép rồi dán vào ghi chú/chat để lưu."
+    or "Executor không hỗ trợ setclipboard.")
+local function copyOut(text, okMsg)
+    if not copyFn then setLbl.Text = "Executor không hỗ trợ sao chép (setclipboard)" return end
+    copyFn(text)
+    setLbl.Text = okMsg
+end
+button(tSet, "Sao chép cấu hình (Config)", function() copyOut(exportConfig(), "Đã sao chép config") end)
+button(tSet, "Sao chép Macro", function()
+    if #rec == 0 then setLbl.Text = "Chưa có bản ghi để sao chép" return end
+    copyOut(exportMacro(), "Đã sao chép macro (" .. #rec .. " bước)")
+end)
+header(tSet, "Dán dữ liệu")
+local pasted = ""
+local pasteBox = textInput(tSet, "Dữ liệu dán", "", function(t) pasted = t end)
+button(tSet, "Nhập dữ liệu (Import)", function()
+    local raw = pasteBox.Text ~= "" and pasteBox.Text or pasted
+    if raw == "" then setLbl.Text = "Chưa dán dữ liệu" return end
+    setLbl.Text = importText(raw)
+    pasteBox.Text, pasted = "", ""
+    setStatus()
+end)
+
+selectTab("Macro")
+refreshRec()
+refreshRun()
+setStatus()
+
+task.spawn(function()
+    while gui.Parent do
+        task.wait(2.5)
+        pcall(lobbyStep)
+    end
+end)
+
+-- ===== VÒNG LẶP CHÍNH (quét giao diện 1 lần / giây) =====
+task.spawn(function()
+    local t = 0
+    local lastSerial = matchSerial
+    while gui.Parent do
+        task.wait(1)
+        t += 1
+
+        local ok, s = pcall(takeSnapshot)
+        if ok and s then
+            snap = s
+            updateWave(s)
+        end
+        if matchSerial ~= lastSerial then
+            lastSerial = matchSerial
+            onNewMatch()
+        end
+
+        if S.autoSkip then fire("SetAutoSkip", true) end
+        if S.autoSpeed and t % 3 == 0 then fire("ChangeTickSpeed", S.speed) end
+        if S.autoReplay then clickSnap("Play Again") end
+        if S.autoLeave then clickSnap("Return to lobby") end
+        if S.voteLevel > 0 then clickSnap("Level " .. S.voteLevel) end
+        if S.upgradeAll and t % 2 == 0 then clickSnap("Upgrade all") end
+
+        if t % 10 == 0 then
+            pcall(function() saveFile(FILE_CFG, HttpService:JSONEncode(S)) end)
+        end
+
+        if S.noEffects and t % 5 == 0 then
+            for _, o in ipairs(workspace:GetDescendants()) do
+                if o:IsA("ParticleEmitter") or o:IsA("Trail") or o:IsA("Beam")
+                    or o:IsA("Smoke") or o:IsA("Fire") or o:IsA("Sparkles") then
+                    o.Enabled = false
+                end
+            end
+        end
+        if S.hidePlayers and t % 2 == 0 then
+            for _, p in ipairs(Players:GetPlayers()) do
+                if p ~= LP and p.Character then
+                    for _, d in ipairs(p.Character:GetDescendants()) do
+                        if d:IsA("BasePart") or d:IsA("Decal") then d.LocalTransparencyModifier = 1 end
+                    end
+                end
+            end
+        end
+    end
+end)
+
+-- ===== ĐI THEO QUÁI =====
+task.spawn(function()
+    while gui.Parent do
+        task.wait(0.15)
+        if S.followMobs then
+            followTarget = leadEnemy(followTarget)
+        else
+            followTarget = nil
+        end
+    end
+end)
+
+RunService.Heartbeat:Connect(function(dt)
+    local ch = LP.Character
+    local h = ch and ch:FindFirstChildOfClass("Humanoid")
+    if h then
+        if S.useWalk then h.WalkSpeed = S.walk end
+        if S.useJump then
+            h.UseJumpPower = true
+            h.JumpPower = S.jump
+        end
+    end
+    if S.followMobs and followTarget and os.clock() > holdUntil then
+        local r = rootPart()
+        local p = r and posOf(followTarget)
+        if r and p then
+            local flat = Vector3.new(r.Position.X - p.X, 0, r.Position.Z - p.Z)
+            local dir = flat.Magnitude > 0.1 and flat.Unit or Vector3.new(0, 0, 1)
+            local goal = CFrame.new(p + dir * S.followDist + Vector3.new(0, 3, 0))
+            if S.followMode == 1 then
+                if (r.Position - goal.Position).Magnitude > 2 then r.CFrame = goal end
+            else
+                r.CFrame = r.CFrame:Lerp(goal, 1 - math.exp(-dt * 25))
+            end
+            r.AssemblyLinearVelocity = Vector3.zero
+        end
+    end
+end)
+
+RunService.Stepped:Connect(function()
+    if S.noclip and LP.Character then
+        for _, p in ipairs(LP.Character:GetDescendants()) do
+            if p:IsA("BasePart") then p.CanCollide = false end
+        end
+    end
+end)
+
+UIS.JumpRequest:Connect(function()
+    if S.infJump then
+        local h = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
+        if h then h:ChangeState(Enum.HumanoidStateType.Jumping) end
+    end
+end)
+
+LP.Idled:Connect(function()
+    if S.antiAFK then
+        pcall(function()
+            VirtualUser:CaptureController()
+            VirtualUser:ClickButton2(Vector2.new(0, 0))
+        end)
+    end
+end)
